@@ -64,18 +64,11 @@ static bool sptm_nvme_map_pages(struct exc_info *ctx)
     u8 template[SPTM_NVME_TCB_SIZE];
     struct sptm_nvme_command *command = sptm_nvme_command(cid);
     u64 tcb_pa = sptm_nvme_tcb(qid, cid);
-    bool handled = false;
-
-    if (!sptm.nvme.coastguard_enabled || !command || !tcb_pa || count > SPTM_NVME_MAX_PRPS)
-        return false;
-
     u64 template_pa = sptm_pointer_pa(template_pointer, sizeof(template));
-    if (!template_pa)
-        return false;
 
-    spin_lock(&sptm.service_lock);
-    if (command->state)
-        goto out;
+    if (!sptm.nvme.coastguard_enabled || !command || !tcb_pa || count > SPTM_NVME_MAX_PRPS ||
+        !template_pa || command->state)
+        return false;
 
     memcpy(template, (void *)template_pa, sizeof(template));
     u32 length = read32((u64)template + 0x04);
@@ -90,23 +83,23 @@ static bool sptm_nvme_map_pages(struct exc_info *ctx)
     u64 first = 0;
     if (count) {
         if (!segment_pointer)
-            goto out;
+            return false;
         size_t segment_size = count * sizeof(u64);
         segment_pa = sptm_pointer_pa(segment_pointer, segment_size);
         if (!segment_pa || (segment_pa & SPTM_PAGE_MASK) + segment_size > SPTM_PAGE_SIZE)
-            goto out;
+            return false;
 
         first = read64(segment_pa);
         if (count == 1 && (first & SPTM_NVME_PRP_PAGE_MASK))
-            goto out;
+            return false;
 
         u32 expected_length = (first & SPTM_NVME_PRP_PAGE_MASK) ? count - 2 : count - 1;
         if (length != expected_length || (template_prp1 && template_prp1 != first))
-            goto out;
+            return false;
         if (count == 2) {
             u64 second = read64(segment_pa + sizeof(u64));
             if (template_prp2 && template_prp2 != second)
-                goto out;
+                return false;
         }
 
         for (size_t index = 0; index < count; index++) {
@@ -114,10 +107,10 @@ static bool sptm_nvme_map_pages(struct exc_info *ctx)
             u64 page = target & ~SPTM_NVME_PRP_PAGE_MASK;
             if ((index && target != page) ||
                 !sptm_nvme_range_allowed(page, SPTM_NVME_PRP_PAGE_SIZE))
-                goto out;
+                return false;
         }
     } else if (length) {
-        goto out;
+        return false;
     }
 
     bool writable = dma_flags & BIT(0);
@@ -130,7 +123,7 @@ static bool sptm_nvme_map_pages(struct exc_info *ctx)
             u64 rollback_target = read64(segment_pa + rollback * sizeof(u64));
             sptm_adjust_data_ref(rollback_target, writable, -1);
         }
-        goto out;
+        return false;
     }
 
     u64 prp_list_pa = 0;
@@ -165,14 +158,7 @@ static bool sptm_nvme_map_pages(struct exc_info *ctx)
 
     memcpy((void *)tcb_pa, template, sizeof(template));
     sysop("dsb sy");
-
-    handled = true;
-
-out:
-    spin_unlock(&sptm.service_lock);
-    if (handled)
-        ctx->regs[0] = SPTM_STATUS_SUCCESS;
-    return handled;
+    return true;
 }
 
 static bool sptm_nvme_tl_idle(struct sptm_nvme_command *command, bool retry)
@@ -232,21 +218,16 @@ static bool sptm_nvme_unmap_pages(struct exc_info *ctx)
     bool retry = ctx->regs[2];
     struct sptm_nvme_command *command = sptm_nvme_command(cid);
     u64 tcb_pa = sptm_nvme_tcb(qid, cid);
-    bool handled = false;
 
-    if (ctx->regs[2] > 1 || !command || !tcb_pa)
-        return false;
-
-    spin_lock(&sptm.service_lock);
-    if (!command->state || command->qid != qid ||
+    if (ctx->regs[2] > 1 || !command || !tcb_pa || !command->state || command->qid != qid ||
         (retry && (!sptm.nvme.tl_wa || command->state != 2)) || (!retry && command->state != 1))
-        goto out;
+        return false;
 
     if (!retry) {
         if (sptm.nvme.vdma_wa) {
             u32 status = read32(sptm.nvme.vdma_status + 0x20000 + cid * 0x20);
             if (status & 0x300)
-                goto out;
+                return false;
         }
         memset((void *)tcb_pa, 0, SPTM_NVME_TCB_SIZE);
         sysop("dsb sy");
@@ -255,14 +236,13 @@ static bool sptm_nvme_unmap_pages(struct exc_info *ctx)
         u32 packed_status = read32(sptm.nvme.nvmmu + NVMMU_TCB_STATUS + (cid / 4) * sizeof(u32));
         u32 cid_status = (packed_status >> ((cid % 4) * 5)) & 0xf;
         if (cid_status)
-            goto out;
+            return false;
     }
 
     if (!sptm_nvme_tl_idle(command, retry)) {
         command->state = 2;
         ctx->regs[0] = 0;
-        handled = true;
-        goto out;
+        return true;
     }
 
     bool writable = command->dma_flags & BIT(0);
@@ -275,7 +255,7 @@ static bool sptm_nvme_unmap_pages(struct exc_info *ctx)
             u64 rollback_target = sptm_nvme_command_target(command, rollback);
             sptm_adjust_data_ref(rollback_target, writable, 1);
         }
-        goto out;
+        return false;
     }
 
     if (command->count > 2) {
@@ -290,11 +270,7 @@ static bool sptm_nvme_unmap_pages(struct exc_info *ctx)
     sysop("dsb sy");
     memset(command, 0, sizeof(*command));
     ctx->regs[0] = 1;
-    handled = true;
-
-out:
-    spin_unlock(&sptm.service_lock);
-    return handled;
+    return true;
 }
 
 static bool sptm_nvme_cache_values(bool *valid, u64 *cache, const u64 *values, size_t count)
@@ -329,123 +305,81 @@ bool sptm_handle_nvme(struct exc_info *ctx, u32 endpoint)
     if (!sptm.nvme.configured)
         return false;
 
+    struct sptm_nvme *nvme = &sptm.nvme;
+    u64 *args = ctx->regs;
+    bool handled = false;
+    spin_lock(&sptm.service_lock);
     switch (endpoint) {
         case 0:
-            spin_lock(&sptm.service_lock);
             sysop("dsb sy");
-            sptm_nvme_mmio_write64_lo_hi(sptm.nvme.nvmmu + NVMMU_ADMIN_TCB_BASE,
-                                         sptm.nvme.admin_tcbs);
-            sptm_nvme_mmio_write64_lo_hi(sptm.nvme.nvmmu + NVMMU_IO_TCB_BASE, sptm.nvme.io_tcbs);
-            sptm_nvme_mmio_write32(sptm.nvme.nvmmu + NVMMU_QUEUE_COUNT,
-                                   sptm.nvme.queue_entries - 1);
-            sptm.nvme.coastguard_enabled = true;
-            spin_unlock(&sptm.service_lock);
-            ctx->regs[0] = SPTM_STATUS_SUCCESS;
-            return true;
+            sptm_nvme_mmio_write64_lo_hi(nvme->nvmmu + NVMMU_ADMIN_TCB_BASE, nvme->admin_tcbs);
+            sptm_nvme_mmio_write64_lo_hi(nvme->nvmmu + NVMMU_IO_TCB_BASE, nvme->io_tcbs);
+            sptm_nvme_mmio_write32(nvme->nvmmu + NVMMU_QUEUE_COUNT, nvme->queue_entries - 1);
+            nvme->coastguard_enabled = true;
+            handled = true;
+            break;
         case 1:
-            return sptm_nvme_map_pages(ctx);
+            handled = sptm_nvme_map_pages(ctx);
+            break;
         case 2:
-            return sptm_nvme_unmap_pages(ctx);
+            // UNMAP_PAGES reports its own completion state in x0.
+            handled = sptm_nvme_unmap_pages(ctx);
+            spin_unlock(&sptm.service_lock);
+            return handled;
         case 3:
-            if (ctx->regs[0] != sptm.nvme.queue_entries || ctx->regs[1] != sptm.nvme.protocol)
-                return false;
-            ctx->regs[0] = SPTM_STATUS_SUCCESS;
-            return true;
-        case 4: {
-            u64 values[] = {ctx->regs[0], ctx->regs[1], ctx->regs[2], ctx->regs[3]};
-            if (!values[1] || values[1] > sptm.nvme.queue_entries || !values[3] ||
-                values[3] > sptm.nvme.queue_entries ||
-                !sptm_nvme_queue_allowed(values[0], values[1] * 0x40) ||
-                !sptm_nvme_queue_allowed(values[2], values[3] * 0x10))
-                return false;
-            spin_lock(&sptm.service_lock);
-            bool valid = sptm_nvme_cache_values(&sptm.nvme.admin_queues_valid,
-                                                sptm.nvme.admin_queues, values, ARRAY_SIZE(values));
-            if (valid) {
-                sptm_nvme_mmio_write32(sptm.nvme.queue_bar + NVME_AQA,
-                                       values[1] | (values[3] << 16));
-                sptm_nvme_mmio_write64_lo_hi(sptm.nvme.queue_bar + NVME_ASQ, values[0]);
-                sptm_nvme_mmio_write64_lo_hi(sptm.nvme.queue_bar + NVME_ACQ, values[2]);
+            handled = args[0] == nvme->queue_entries && args[1] == nvme->protocol;
+            break;
+        case 4:
+            // Admin queues: submission base and size, then completion base and size.
+            handled =
+                args[1] && args[1] <= nvme->queue_entries && args[3] &&
+                args[3] <= nvme->queue_entries &&
+                sptm_nvme_queue_allowed(args[0], args[1] * 0x40) &&
+                sptm_nvme_queue_allowed(args[2], args[3] * 0x10) &&
+                sptm_nvme_cache_values(&nvme->admin_queues_valid, nvme->admin_queues, args, 4);
+            if (handled) {
+                sptm_nvme_mmio_write32(nvme->queue_bar + NVME_AQA, args[1] | (args[3] << 16));
+                sptm_nvme_mmio_write64_lo_hi(nvme->queue_bar + NVME_ASQ, args[0]);
+                sptm_nvme_mmio_write64_lo_hi(nvme->queue_bar + NVME_ACQ, args[2]);
             }
-            spin_unlock(&sptm.service_lock);
-            if (!valid)
-                return false;
-            ctx->regs[0] = SPTM_STATUS_SUCCESS;
-            return true;
-        }
-        case 5: {
-            u64 values[] = {ctx->regs[0], ctx->regs[1]};
-            if (!values[0] || values[0] > sptm.nvme.queue_entries || !values[1] ||
-                values[1] > sptm.nvme.queue_entries)
-                return false;
-            spin_lock(&sptm.service_lock);
-            bool valid = sptm_nvme_cache_values(&sptm.nvme.io_sizes_valid, sptm.nvme.io_sizes,
-                                                values, ARRAY_SIZE(values));
-            if (valid) {
-                sptm_nvme_mmio_write32(sptm.nvme.queue_bar + NVME_IOQA,
-                                       values[0] | (values[1] << 16));
-            }
-            spin_unlock(&sptm.service_lock);
-            if (!valid)
-                return false;
-            ctx->regs[0] = SPTM_STATUS_SUCCESS;
-            return true;
-        }
+            break;
+        case 5:
+            handled = args[0] && args[0] <= nvme->queue_entries && args[1] &&
+                      args[1] <= nvme->queue_entries &&
+                      sptm_nvme_cache_values(&nvme->io_sizes_valid, nvme->io_sizes, args, 2);
+            if (handled)
+                sptm_nvme_mmio_write32(nvme->queue_bar + NVME_IOQA, args[0] | (args[1] << 16));
+            break;
         case 6: {
-            u64 value = ctx->regs[0];
-            u64 size = sptm.nvme.io_sizes_valid ? sptm.nvme.io_sizes[0] : sptm.nvme.queue_entries;
-            if (!sptm_nvme_queue_allowed(value, size * 0x40))
-                return false;
-            spin_lock(&sptm.service_lock);
-            bool valid =
-                sptm_nvme_cache_values(&sptm.nvme.io_sq_valid, &sptm.nvme.io_sq, &value, 1);
-            if (valid) {
-                sptm_nvme_mmio_write64_lo_hi(sptm.nvme.queue_bar + NVME_IOSQ, value);
-            }
-            spin_unlock(&sptm.service_lock);
-            if (!valid)
-                return false;
-            ctx->regs[0] = SPTM_STATUS_SUCCESS;
-            return true;
+            u64 size = nvme->io_sizes_valid ? nvme->io_sizes[0] : nvme->queue_entries;
+            handled = sptm_nvme_queue_allowed(args[0], size * 0x40) &&
+                      sptm_nvme_cache_values(&nvme->io_sq_valid, &nvme->io_sq, args, 1);
+            if (handled)
+                sptm_nvme_mmio_write64_lo_hi(nvme->queue_bar + NVME_IOSQ, args[0]);
+            break;
         }
         case 7: {
-            u64 value = ctx->regs[0];
-            u64 size = sptm.nvme.io_sizes_valid ? sptm.nvme.io_sizes[1] : sptm.nvme.queue_entries;
-            if (!sptm_nvme_queue_allowed(value, size * 0x10))
-                return false;
-            spin_lock(&sptm.service_lock);
-            bool valid =
-                sptm_nvme_cache_values(&sptm.nvme.io_cq_valid, &sptm.nvme.io_cq, &value, 1);
-            if (valid) {
-                sptm_nvme_mmio_write64_lo_hi(sptm.nvme.queue_bar + NVME_IOCQ, value);
-            }
-            spin_unlock(&sptm.service_lock);
-            if (!valid)
-                return false;
-            ctx->regs[0] = SPTM_STATUS_SUCCESS;
-            return true;
+            u64 size = nvme->io_sizes_valid ? nvme->io_sizes[1] : nvme->queue_entries;
+            handled = sptm_nvme_queue_allowed(args[0], size * 0x10) &&
+                      sptm_nvme_cache_values(&nvme->io_cq_valid, &nvme->io_cq, args, 1);
+            if (handled)
+                sptm_nvme_mmio_write64_lo_hi(nvme->queue_bar + NVME_IOCQ, args[0]);
+            break;
         }
-        case 8: {
-            u64 values[] = {ctx->regs[0], ctx->regs[1], ctx->regs[2]};
-            if (!sptm.nvme.sha_present || (values[0] & SPTM_PAGE_MASK) ||
-                values[1] != SPTM_PAGE_SIZE || (values[2] & ~3ULL) ||
-                !sptm_nvme_range_allowed(values[0], values[1]))
-                return false;
-            spin_lock(&sptm.service_lock);
-            bool valid = sptm_nvme_cache_values(&sptm.nvme.sha_valid, sptm.nvme.sha, values,
-                                                ARRAY_SIZE(values));
-            if (valid) {
-                write32(sptm.nvme.sha_base, values[0] >> SPTM_PAGE_SHIFT);
-                write32(sptm.nvme.sha_base + 4, values[2]);
+        case 8:
+            handled = nvme->sha_present && !(args[0] & SPTM_PAGE_MASK) &&
+                      args[1] == SPTM_PAGE_SIZE && !(args[2] & ~3ULL) &&
+                      sptm_nvme_range_allowed(args[0], args[1]) &&
+                      sptm_nvme_cache_values(&nvme->sha_valid, nvme->sha, args, 3);
+            if (handled) {
+                write32(nvme->sha_base, args[0] >> SPTM_PAGE_SHIFT);
+                write32(nvme->sha_base + 4, args[2]);
                 sysop("dsb sy");
             }
-            spin_unlock(&sptm.service_lock);
-            if (!valid)
-                return false;
-            ctx->regs[0] = SPTM_STATUS_SUCCESS;
-            return true;
-        }
-        default:
-            __builtin_unreachable();
+            break;
     }
+    spin_unlock(&sptm.service_lock);
+    if (handled)
+        ctx->regs[0] = SPTM_STATUS_SUCCESS;
+    return handled;
 }
