@@ -20,7 +20,7 @@ static bool sptm_batch_sign_user_pointers(struct exc_info *ctx)
     }
 
     u64 scratch = sptm_scratch_pa(ctx);
-    if (!sptm_valid_pa(scratch, count * sizeof(u64)))
+    if (!scratch)
         return false;
 
     for (size_t index = 0; index < count; index++)

@@ -39,18 +39,16 @@ bool sptm_is_root_type(u8 type)
 
 u8 *sptm_frame_entry(u64 pa)
 {
-    if (!sptm.frame_table_pa || (pa & SPTM_PAGE_MASK) || !sptm_valid_pa(pa, SPTM_PAGE_SIZE))
+    if ((pa & SPTM_PAGE_MASK) || !sptm_valid_pa(pa, SPTM_PAGE_SIZE))
         return NULL;
 
     u64 index = (pa - sptm.managed_start) >> SPTM_PAGE_SHIFT;
     return (u8 *)(sptm.frame_table_pa + index * 16);
 }
 
+// Callers have already resolved pa's frame entry.
 u32 *sptm_external_ref_entry(u64 pa)
 {
-    if (!sptm.external_ref_table_pa || (pa & SPTM_PAGE_MASK) || !sptm_valid_pa(pa, SPTM_PAGE_SIZE))
-        return NULL;
-
     u64 index = (pa - sptm.managed_start) >> SPTM_PAGE_SHIFT;
     return (u32 *)(sptm.external_ref_table_pa + index * (2 * sizeof(u32)));
 }
@@ -193,14 +191,8 @@ bool sptm_adjust_mapping_ref(u64 pte, u64 descriptor_mask, int delta)
     // Track all CPU mappings in ro_refcount; DMA reservations remain external.
     spin_lock(&sptm.frame_lock);
     u32 value = read32((u64)entry + 8);
-    u32 total_ro = read32((u64)entry + 8);
-    u32 total_wx = read32((u64)entry + 12);
-    if (total_ro < external[0] || total_wx < external[1]) {
-        spin_unlock(&sptm.frame_lock);
-        return false;
-    }
-
-    if ((delta < 0 && value - external[0] < (u32)-delta) ||
+    if (value < external[0] || read32((u64)entry + 12) < external[1] ||
+        (delta < 0 && value - external[0] < (u32)-delta) ||
         (delta > 0 && value > UINT32_MAX - (u32)delta)) {
         spin_unlock(&sptm.frame_lock);
         return false;

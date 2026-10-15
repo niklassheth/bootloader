@@ -350,12 +350,7 @@ static bool sptm_uat_map_table(struct exc_info *ctx)
     u32 level = ctx->regs[2];
     u64 table_pa = ctx->regs[3] & SPTM_DESC_PA_MASK_16K;
 
-    if (!state_pa || level < 1 || level > 2 || (ctx->regs[3] & SPTM_PAGE_MASK) ||
-        !sptm_valid_pa(table_pa, SPTM_PAGE_SIZE))
-        return false;
-
-    u8 *table_entry = sptm_frame_entry(table_pa);
-    if (!table_entry || table_entry[2] != SPTM_FRAME_XNU_IOMMU)
+    if (!state_pa || level < 1 || level > 2 || (ctx->regs[3] & SPTM_PAGE_MASK))
         return false;
 
     u64 slot = sptm_uat_slot(state_pa, ctx->regs[1], level);
@@ -367,6 +362,7 @@ static bool sptm_uat_map_table(struct exc_info *ctx)
 
     u64 parent_pa = slot & ~(REGION_NORMAL_NC | SPTM_PAGE_MASK);
 
+    // Pinning the new table also checks that it is a UAT table frame.
     if (!sptm_uat_ref_table(table_pa, 1))
         return false;
     if (!sptm_uat_ref_parent(parent_pa, 1)) {

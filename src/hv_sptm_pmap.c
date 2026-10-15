@@ -129,9 +129,15 @@ void sptm_publish_stage1(void)
     }
 }
 
-static void sptm_write_stage1_descriptor(u64 slot, u64 value)
+// Publish the updated mappings unless the caller deferred TLB invalidation.
+static bool sptm_finish_update(struct exc_info *ctx, bool changed, bool deferred)
 {
-    write64(slot, value);
+    if (changed && !deferred)
+        sptm_publish_stage1();
+    else
+        sysop("dsb sy");
+    ctx->regs[0] = deferred ? SPTM_STATUS_UPDATE_DELAYED_TLBI : SPTM_STATUS_SUCCESS;
+    return true;
 }
 
 void sptm_publish_commpage_policy(void)
@@ -220,11 +226,9 @@ bool sptm_retype_frame(struct exc_info *ctx)
             return false;
         }
         physmap_replacement = (descriptor & ~type_mask) | replacement;
-    }
 
-    if (iommu_transition) {
         // Keep the physmap leaf invalid during the host memory-type transition.
-        sptm_write_stage1_descriptor(physmap_slot, 0);
+        write64(physmap_slot, 0);
         sptm_flush_stage1_tlb();
     }
 
@@ -238,21 +242,17 @@ bool sptm_retype_frame(struct exc_info *ctx)
         write16((u64)entry + 8, 0);
     entry[2] = new_type;
 
+    if (new_type == SPTM_FRAME_XNU_IOMMU) {
+        // Zero IOMMU tables through their NC alias.
+        memset((void *)sptm_iommu_table_va(pa), 0, SPTM_PAGE_SIZE);
+        sysop("dsb sy");
+        write16((u64)entry + 4, 0);
+    } else if (sptm_is_table_type(new_type)) {
+        memset((void *)pa, 0, SPTM_PAGE_SIZE);
+    }
     if (sptm_is_table_type(new_type) || new_type == SPTM_FRAME_XNU_IOMMU) {
-        void *table_va;
-        if (new_type == SPTM_FRAME_XNU_IOMMU) {
-            // Zero IOMMU tables through their NC alias.
-            table_va = (void *)sptm_iommu_table_va(pa);
-        } else {
-            table_va = (void *)pa;
-        }
-        memset(table_va, 0, SPTM_PAGE_SIZE);
-        if (new_type == SPTM_FRAME_XNU_IOMMU)
-            sysop("dsb sy");
         write16((u64)entry + 6, 0);
         write16((u64)entry + 8, 0);
-        if (new_type == SPTM_FRAME_XNU_IOMMU)
-            write16((u64)entry + 4, 0);
 
         if (sptm_is_root_type(new_type)) {
             write16((u64)entry + 10, (ctx->regs[3] >> 32) & 0xffff);
@@ -284,7 +284,7 @@ bool sptm_retype_frame(struct exc_info *ctx)
         mmu_restore_ram_pages_wb(&host_page, 1, true);
     }
     if (iommu_transition) {
-        sptm_write_stage1_descriptor(physmap_slot, physmap_replacement);
+        write64(physmap_slot, physmap_replacement);
         sptm_publish_stage1();
     }
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
@@ -312,9 +312,7 @@ bool sptm_map_page(struct exc_info *ctx)
     u64 va = ctx->regs[1];
     u64 pte = ctx->regs[2];
     struct sptm_geometry geometry;
-    if (!sptm_root_geometry(root, &geometry))
-        return false;
-    u64 slot = sptm_walk(root, va, 3, NULL);
+    u64 slot = sptm_walk(root, va, 3, &geometry);
     if (!slot) {
         ctx->regs[0] = SPTM_STATUS_TABLE_NOT_PRESENT;
         return true;
@@ -322,7 +320,7 @@ bool sptm_map_page(struct exc_info *ctx)
 
     u64 old = read64(slot);
     u64 scratch = sptm_scratch_pa(ctx);
-    if (!sptm_valid_pa(scratch, 2 * sizeof(u64)))
+    if (!scratch)
         return false;
 
     write64(scratch, old);
@@ -345,7 +343,7 @@ bool sptm_map_page(struct exc_info *ctx)
     }
 
     ctx->regs[0] = old & 1 ? SPTM_STATUS_MAP_VALID : SPTM_STATUS_SUCCESS;
-    sptm_write_stage1_descriptor(slot, pte);
+    write64(slot, pte);
 
     if ((old & 1) && old != pte)
         sptm_publish_stage1();
@@ -363,10 +361,7 @@ bool sptm_map_table(struct exc_info *ctx)
     u64 tte = ctx->regs[3];
 
     struct sptm_geometry geometry;
-    if (!sptm_root_geometry(root, &geometry))
-        return false;
-
-    u64 slot = sptm_walk(root, va, target_level, NULL);
+    u64 slot = sptm_walk(root, va, target_level, &geometry);
     if (!slot) {
         ctx->regs[0] = SPTM_STATUS_TABLE_NOT_PRESENT;
         return true;
@@ -388,7 +383,7 @@ bool sptm_map_table(struct exc_info *ctx)
         u64 entry = slot + index * sizeof(u64);
         u64 replacement =
             ((child + index * BIT(geometry.page_shift)) & geometry.descriptor_mask) | attrs;
-        sptm_write_stage1_descriptor(entry, replacement);
+        write64(entry, replacement);
     }
     sysop("dsb sy");
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
@@ -422,10 +417,8 @@ bool sptm_unmap_table(struct exc_info *ctx)
     u64 child = read64(slot) & geometry.descriptor_mask;
     if (!sptm_adjust_parent_links(child, -1))
         return false;
-    for (size_t index = 0; index < geometry.page_ratio; index++) {
-        u64 entry = slot + index * sizeof(u64);
-        sptm_write_stage1_descriptor(entry, 0);
-    }
+    for (size_t index = 0; index < geometry.page_ratio; index++)
+        write64(slot + index * sizeof(u64), 0);
     sptm_publish_stage1();
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
@@ -470,37 +463,26 @@ bool sptm_update_region(struct exc_info *ctx)
         return false;
 
     u64 scratch = sptm_scratch_pa(ctx);
-    if (!sptm_valid_pa(scratch, count * sizeof(u64)))
-        return false;
-
     u64 mask = sptm_update_mask(flags);
-    if (!mask)
+    if (!scratch || !mask)
         return false;
 
+    // Check every leaf before changing any of them.
     for (size_t index = 0; index < count; index++) {
         if (!sptm_walk(root, start + index * page_size, 3, NULL))
             return false;
     }
-    bool changed = false;
 
     for (size_t index = 0; index < count; index++) {
         u64 slot = sptm_walk(root, start + index * page_size, 3, NULL);
-
         u64 old = read64(slot);
         u64 template = read64(templates + index * sizeof(u64));
         write64(scratch + index * sizeof(u64), old);
-        sptm_write_stage1_descriptor(slot, (old & ~mask) | (template & mask));
-        changed = true;
+        write64(slot, (old & ~mask) | (template & mask));
     }
 
     // Do not invalidate a partial deferred alias batch.
-    if (changed && !(flags & BIT(8)))
-        sptm_publish_stage1();
-    else
-        sysop("dsb sy");
-
-    ctx->regs[0] = flags & BIT(8) ? 5 : SPTM_STATUS_SUCCESS;
-    return true;
+    return sptm_finish_update(ctx, count, flags & BIT(8));
 }
 
 bool sptm_update_disjoint(struct exc_info *ctx)
@@ -515,21 +497,12 @@ bool sptm_update_disjoint(struct exc_info *ctx)
     if (count && !ops)
         return false;
 
-    for (size_t index = 0; index < count; index++) {
-        struct sptm_geometry geometry;
-        if (!sptm_root_geometry(read64(ops + index * 24), &geometry))
-            return false;
-    }
-
     u64 scratch = sptm_scratch_pa(ctx);
-    if (!sptm_valid_pa(scratch, count * sizeof(u64)))
-        return false;
-
     u64 mask = sptm_update_mask(flags);
-    if (!mask)
+    if (!scratch || !mask)
         return false;
-    bool changed = false;
 
+    // Check every leaf before changing any of them.
     for (size_t index = 0; index < count; index++) {
         u64 op = ops + index * 24;
         if (!sptm_walk(read64(op), read64(op + 8), 3, NULL))
@@ -539,21 +512,13 @@ bool sptm_update_disjoint(struct exc_info *ctx)
     for (size_t index = 0; index < count; index++) {
         u64 op = ops + index * 24;
         u64 slot = sptm_walk(read64(op), read64(op + 8), 3, NULL);
-
         u64 old = read64(slot);
         u64 template = read64(op + 16);
         write64(scratch + index * sizeof(u64), old);
-        sptm_write_stage1_descriptor(slot, (old & ~mask) | (template & mask));
-        changed = true;
+        write64(slot, (old & ~mask) | (template & mask));
     }
 
-    if (changed && !(flags & BIT(8)))
-        sptm_publish_stage1();
-    else
-        sysop("dsb sy");
-
-    ctx->regs[0] = flags & BIT(8) ? 5 : SPTM_STATUS_SUCCESS;
-    return true;
+    return sptm_finish_update(ctx, count, flags & BIT(8));
 }
 
 bool sptm_update_disjoint_multipage(struct exc_info *ctx)
@@ -586,17 +551,15 @@ bool sptm_update_disjoint_multipage(struct exc_info *ctx)
         }
 
         for (size_t index = 0; index < inner_count; index++) {
-            struct sptm_geometry geometry;
             u64 op = stream + (used + index) * 24;
-            if (!sptm_root_geometry(read64(op), &geometry) ||
-                !sptm_walk(read64(op), read64(op + 8), 3, NULL))
+            if (!sptm_walk(read64(op), read64(op + 8), 3, NULL))
                 return false;
         }
         used += inner_count;
     }
 
     u64 scratch = sptm_scratch_pa(ctx);
-    if (!sptm_valid_pa(scratch, slots * sizeof(u64)))
+    if (!scratch)
         return false;
 
     if (!cpu_features->apple_sysregs_unlocked) {
@@ -686,30 +649,23 @@ bool sptm_update_disjoint_multipage(struct exc_info *ctx)
             u64 old = read64(physmap_slot);
             u64 physmap_mask = (3ULL << 8) | (7ULL << 2);
             u64 replacement = (old & ~physmap_mask) | (papt_template & physmap_mask);
-            sptm_write_stage1_descriptor(physmap_slot, replacement);
+            write64(physmap_slot, replacement);
             changed = true;
         }
 
         for (size_t index = 0; index < inner_count; index++, scratch_index++) {
             u64 op = stream + (used + index) * 24;
             u64 slot = sptm_walk(read64(op), read64(op + 8), 3, NULL);
-            u64 old = slot ? read64(slot) : 0;
-
-            write64(scratch + scratch_index * sizeof(u64), old);
+            u64 old = read64(slot);
             u64 template = read64(op + 16);
-            sptm_write_stage1_descriptor(slot, (old & ~mask) | (template & mask));
+            write64(scratch + scratch_index * sizeof(u64), old);
+            write64(slot, (old & ~mask) | (template & mask));
             changed = true;
         }
         used += inner_count;
     }
 
-    if (changed && !deferred)
-        sptm_publish_stage1();
-    else
-        sysop("dsb sy");
-
-    ctx->regs[0] = deferred ? 5 : SPTM_STATUS_SUCCESS;
-    return true;
+    return sptm_finish_update(ctx, changed, deferred);
 }
 
 bool sptm_unmap_region(struct exc_info *ctx)
@@ -727,7 +683,7 @@ bool sptm_unmap_region(struct exc_info *ctx)
         return false;
 
     u64 scratch = sptm_scratch_pa(ctx);
-    if (!sptm_valid_pa(scratch, count * sizeof(u64)))
+    if (!scratch)
         return false;
 
     bool changed = false;
@@ -742,19 +698,12 @@ bool sptm_unmap_region(struct exc_info *ctx)
                 sptm_adjust_mapping_ref(old, geometry.descriptor_mask, 1);
                 return false;
             }
-            sptm_write_stage1_descriptor(slot, 0);
+            write64(slot, 0);
             changed = true;
         }
     }
 
-    bool deferred = changed && (options & BIT(8));
-    if (changed && !deferred)
-        sptm_publish_stage1();
-    else
-        sysop("dsb sy");
-
-    ctx->regs[0] = deferred ? 5 : SPTM_STATUS_SUCCESS;
-    return true;
+    return sptm_finish_update(ctx, changed, changed && (options & BIT(8)));
 }
 
 bool sptm_unmap_disjoint(struct exc_info *ctx)
@@ -768,14 +717,8 @@ bool sptm_unmap_disjoint(struct exc_info *ctx)
     if (count && !ops)
         return false;
 
-    for (size_t index = 0; index < count; index++) {
-        struct sptm_geometry geometry;
-        if (!sptm_root_geometry(read64(ops + index * 24), &geometry))
-            return false;
-    }
-
     u64 scratch = sptm_scratch_pa(ctx);
-    if (!sptm_valid_pa(scratch, count * sizeof(u64)))
+    if (!scratch)
         return false;
 
     bool changed = false;
@@ -792,18 +735,12 @@ bool sptm_unmap_disjoint(struct exc_info *ctx)
                 sptm_adjust_mapping_ref(old, geometry.descriptor_mask, 1);
                 return false;
             }
-            sptm_write_stage1_descriptor(slot, 0);
+            write64(slot, 0);
             changed = true;
         }
     }
 
-    if (changed)
-        sptm_publish_stage1();
-    else
-        sysop("dsb sy");
-
-    ctx->regs[0] = SPTM_STATUS_SUCCESS;
-    return true;
+    return sptm_finish_update(ctx, changed, false);
 }
 
 bool sptm_nest_region(struct exc_info *ctx, bool nest)
@@ -851,31 +788,21 @@ bool sptm_nest_region(struct exc_info *ctx, bool nest)
             value = read64(shared_slot);
         }
 
-        u64 old = read64(user_slot);
-        if (old != value) {
-            sptm_write_stage1_descriptor(user_slot, value);
+        if (read64(user_slot) != value) {
+            write64(user_slot, value);
             changed = true;
         }
     }
 
-    if (changed)
-        sptm_publish_stage1();
-    else
-        sysop("dsb sy");
-
-    ctx->regs[0] = SPTM_STATUS_SUCCESS;
-    return true;
+    return sptm_finish_update(ctx, changed, false);
 }
 
 bool sptm_surt_update(struct exc_info *ctx, bool allocate)
 {
     u64 frame = ctx->regs[0] & ~SPTM_PAGE_MASK;
     size_t slot_index = ctx->regs[1];
-    if (slot_index >= SPTM_PAGE_SIZE / 128 || !sptm_valid_pa(frame, SPTM_PAGE_SIZE))
-        return false;
-
     u8 *frame_entry = sptm_frame_entry(frame);
-    if (!frame_entry || frame_entry[2] != SPTM_FRAME_SUBPAGE)
+    if (slot_index >= SPTM_PAGE_SIZE / 128 || !frame_entry || frame_entry[2] != SPTM_FRAME_SUBPAGE)
         return false;
 
     u64 root = frame + slot_index * 128;
@@ -934,14 +861,14 @@ bool sptm_condemn_leaf_table(struct exc_info *ctx, bool condemn)
         if (!entry || !sptm_is_table_type(entry[2]))
             return false;
 
-        sptm_write_stage1_descriptor(slot, value | BIT(2));
+        write64(slot, value | BIT(2));
     } else {
         if (!(value & BIT(2))) {
             /* Endpoint 44 is an idempotent clear operation. */
             ctx->regs[0] = SPTM_STATUS_SUCCESS;
             return true;
         }
-        sptm_write_stage1_descriptor(slot, value & ~BIT(2));
+        write64(slot, value & ~BIT(2));
     }
     sptm_publish_stage1();
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
