@@ -2,6 +2,8 @@
 
 #include "hv_sptm_internal.h"
 
+static const u32 sptm_dart_shifts[] = {36, 25, SPTM_PAGE_SHIFT};
+
 struct sptm_dart *sptm_find_dart(u32 id)
 {
     for (size_t index = 0; index < sptm.dart_count; index++) {
@@ -12,22 +14,24 @@ struct sptm_dart *sptm_find_dart(u32 id)
     return NULL;
 }
 
-static bool sptm_dart_flush_sid(struct sptm_dart *dart, u32 sid)
+static bool sptm_dart_tlb_op(struct sptm_dart *dart, u32 op, u64 start, u64 end)
 {
     // TLB registers are inaccessible while the DART is powered down.
-    if (!dart->powered) {
+    if (!dart->powered)
         return true;
-    }
 
     sysop("dsb sy");
     for (size_t index = 0; index < dart->instance_count; index++) {
         u64 base = dart->instances[index];
-        write32(base + DART_TLB_OP, DART_TLB_FLUSH_SID | sid);
-        for (size_t retry = 0; retry < 10000; retry++) {
-            if (!(read32(base + DART_TLB_OP) & DART_TLB_BUSY))
-                break;
-            if (retry == 9999) {
-                printf("HV: SPTM DART %u SID %u TLB flush timed out at 0x%lx\n", dart->id, sid,
+        if (op & DART_TLB_FLUSH_DVA) {
+            write32(base + DART_TLB_START_DVA, start >> SPTM_PAGE_SHIFT);
+            write32(base + DART_TLB_END_DVA, (end - 1) >> SPTM_PAGE_SHIFT);
+        }
+        write32(base + DART_TLB_OP, op);
+        size_t retry = 0;
+        while (read32(base + DART_TLB_OP) & DART_TLB_BUSY) {
+            if (++retry == 10000) {
+                printf("HV: SPTM DART %u TLB operation 0x%x timed out at 0x%lx\n", dart->id, op,
                        base);
                 return false;
             }
@@ -35,57 +39,32 @@ static bool sptm_dart_flush_sid(struct sptm_dart *dart, u32 sid)
     }
     sysop("dsb sy");
     return true;
+}
+
+static bool sptm_dart_flush_sid(struct sptm_dart *dart, u32 sid)
+{
+    return sptm_dart_tlb_op(dart, DART_TLB_FLUSH_SID | sid, 0, 0);
 }
 
 static bool sptm_dart_flush_range(struct sptm_dart *dart, u32 sid, u64 start, u64 end)
 {
-    if (!dart->powered) {
-        return true;
-    }
-
     if (!(dart->flags & SPTM_DART_FLUSH_BY_DVA) || !dart->hardware_flush_supported || start >= end)
         return sptm_dart_flush_sid(dart, sid);
+    return sptm_dart_tlb_op(
+        dart, DART_TLB_HARDWARE_FLUSH | DART_TLB_FLUSH_DVA | DART_TLB_FLUSH_SID | sid, start, end);
+}
 
-    sysop("dsb sy");
-    for (size_t index = 0; index < dart->instance_count; index++) {
-        u64 base = dart->instances[index];
-        write32(base + DART_TLB_START_DVA, start >> SPTM_PAGE_SHIFT);
-        write32(base + DART_TLB_END_DVA, (end - 1) >> SPTM_PAGE_SHIFT);
-        write32(base + DART_TLB_OP,
-                DART_TLB_HARDWARE_FLUSH | DART_TLB_FLUSH_DVA | DART_TLB_FLUSH_SID | sid);
-        for (size_t retry = 0; retry < 10000; retry++) {
-            if (!(read32(base + DART_TLB_OP) & DART_TLB_BUSY))
-                break;
-            if (retry == 9999) {
-                printf("HV: SPTM DART %u SID %u DVA flush timed out at 0x%lx\n", dart->id, sid,
-                       base);
-                return false;
-            }
-        }
-    }
-    sysop("dsb sy");
-    return true;
+// Flush the DVA range covered by one entry of a level-`level` table.
+static bool sptm_dart_flush_entry(struct sptm_dart *dart, u32 sid, u64 dva, u32 level)
+{
+    u64 span = BIT(sptm_dart_shifts[level]);
+    u64 start = dva & ~(span - 1);
+    return sptm_dart_flush_range(dart, sid, start, start + span);
 }
 
 bool sptm_dart_flush_all(struct sptm_dart *dart)
 {
-    if (!dart->powered) {
-        return true;
-    }
-
-    sysop("dsb sy");
-    for (size_t index = 0; index < dart->instance_count; index++) {
-        u64 base = dart->instances[index];
-        write32(base + DART_TLB_OP, DART_TLB_FLUSH_ALL);
-        for (size_t retry = 0; retry < 10000; retry++) {
-            if (!(read32(base + DART_TLB_OP) & DART_TLB_BUSY))
-                break;
-            if (retry == 9999)
-                return false;
-        }
-    }
-    sysop("dsb sy");
-    return true;
+    return sptm_dart_tlb_op(dart, DART_TLB_FLUSH_ALL, 0, 0);
 }
 
 struct sptm_dart_sid *sptm_dart_sid(const struct sptm_dart *dart, u32 sid)
@@ -93,6 +72,16 @@ struct sptm_dart_sid *sptm_dart_sid(const struct sptm_dart *dart, u32 sid)
     if (!dart->sid_states || sid >= dart->sid_count)
         return NULL;
     return &dart->sid_states[sid];
+}
+
+static struct sptm_dart_sid *sptm_dart_translating_sid(const struct sptm_dart *dart, u32 sid)
+{
+    struct sptm_dart_sid *state = dart ? sptm_dart_sid(dart, sid) : NULL;
+    if (!state || !(state->flags & SPTM_DART_SID_KNOWN) ||
+        (state->flags & (SPTM_DART_SID_POLICY | SPTM_DART_SID_EXCLAVE)) ||
+        !(state->tcr & DART_TCR_TRANSLATE))
+        return NULL;
+    return state;
 }
 
 bool sptm_dart_valid_table(const struct sptm_dart_sid *state, u64 pa, size_t size)
@@ -114,8 +103,6 @@ bool sptm_dart_valid_table(const struct sptm_dart_sid *state, u64 pa, size_t siz
 
 static bool sptm_dart_validate_dva(const struct sptm_dart_sid *state, u64 dva, u64 size)
 {
-    if (!state)
-        return false;
     if (!state->dva_size)
         return true;
     if (dva < state->dva_base)
@@ -125,53 +112,56 @@ static bool sptm_dart_validate_dva(const struct sptm_dart_sid *state, u64 dva, u
     return offset <= state->dva_size && size <= state->dva_size - offset;
 }
 
-/* Return 1 for a translating SID, 0 for an unused SID, and -1 for policy state. */
-static int sptm_dart_root(const struct sptm_dart *dart, u32 sid, u64 *root, u32 *root_level)
-{
-    struct sptm_dart_sid *state = sptm_dart_sid(dart, sid);
-    if (!state)
-        return -1;
-    if (!(state->flags & SPTM_DART_SID_KNOWN))
-        return 0;
-    if ((state->flags & (SPTM_DART_SID_POLICY | SPTM_DART_SID_EXCLAVE)) ||
-        !(state->tcr & DART_TCR_TRANSLATE))
-        return -1;
-
-    *root_level = state->root_level;
-    if (!state->root)
-        return 0;
-    if (!sptm_dart_valid_table(state, state->root, SPTM_PAGE_SIZE))
-        return -1;
-    *root = state->root;
-    return 1;
-}
-
-// Access live DART tables only through the Normal-NC alias.
 static u64 sptm_dart_desc_pa(u64 descriptor)
 {
     return ((descriptor >> 10) & DART_PTE_OFFSET_MASK) << SPTM_PAGE_SHIFT;
 }
 
-static u64 sptm_dart_leaf(const struct sptm_dart_sid *state, u64 root, u32 root_level, u64 dva)
+static u64 sptm_dart_desc(u64 pa)
 {
-    static const u32 shifts[] = {36, 25};
-    u64 table = root;
+    return (((pa >> SPTM_PAGE_SHIFT) & DART_PTE_OFFSET_MASK) << 10) | DART_PTE_VALID;
+}
 
-    for (u32 level = root_level; level < 2; level++) {
-        u64 slot = table + (((dva >> shifts[level]) & 0x7ff) * sizeof(u64));
-        if (!sptm_dart_valid_table(state, slot, sizeof(u64)))
-            return 0;
+/*
+ * Walk from the SID's root to dva's slot in the level-`level` table. Live DART
+ * tables are only accessed through their Normal-NC alias, which is returned.
+ */
+static u64 sptm_dart_slot(const struct sptm_dart_sid *state, u64 dva, u32 level)
+{
+    u64 table = state->root;
+    if (!table || !sptm_dart_valid_table(state, table, SPTM_PAGE_SIZE))
+        return 0;
 
-        u64 descriptor = read64(sptm_iommu_table_va(slot));
+    for (u32 current = state->root_level;; current++) {
+        u64 slot =
+            sptm_iommu_table_va(table) + ((dva >> sptm_dart_shifts[current]) & 0x7ff) * sizeof(u64);
+        if (current == level)
+            return slot;
+
+        u64 descriptor = read64(slot);
         if (!(descriptor & DART_PTE_VALID))
             return 0;
-
         table = sptm_dart_desc_pa(descriptor);
         if (!sptm_dart_valid_table(state, table, SPTM_PAGE_SIZE))
             return 0;
     }
+}
 
-    return table;
+// Firmware-locked TTBRs cannot be written, so they must already hold the value.
+static bool sptm_dart_set_ttbr(struct sptm_dart *dart, u32 sid, u32 ttbr)
+{
+    if (!dart->powered)
+        return true;
+
+    for (size_t index = 0; index < dart->instance_count; index++) {
+        u64 base = dart->instances[index];
+        u64 reg = base + DART_TTBR + sid * sizeof(u32);
+        if (!(read32(base + DART_REG_PROTECT) & BIT(0)))
+            write32(reg, ttbr);
+        else if (read32(reg) != ttbr)
+            return false;
+    }
+    return true;
 }
 
 static bool sptm_dart_map_table(struct exc_info *ctx)
@@ -181,78 +171,33 @@ static bool sptm_dart_map_table(struct exc_info *ctx)
     u64 dva = ctx->regs[2];
     u32 level = ctx->regs[3];
     u64 table_pa = ctx->regs[4];
-    struct sptm_dart_sid *state;
+    struct sptm_dart_sid *state = sptm_dart_translating_sid(dart, sid);
 
-    if (!dart || sid >= dart->sid_count || level > 2 || (table_pa & SPTM_PAGE_MASK))
-        return false;
-    state = sptm_dart_sid(dart, sid);
-    if (!state || !(state->flags & SPTM_DART_SID_KNOWN) ||
-        (state->flags & (SPTM_DART_SID_POLICY | SPTM_DART_SID_EXCLAVE)) ||
-        !(state->tcr & DART_TCR_TRANSLATE) ||
-        !sptm_dart_valid_table(state, table_pa, SPTM_PAGE_SIZE) || level < state->root_level ||
+    if (!state || level > 2 || level < state->root_level || (table_pa & SPTM_PAGE_MASK) ||
+        !sptm_dart_valid_table(state, table_pa, SPTM_PAGE_SIZE) ||
         !sptm_dart_validate_dva(state, dva, 1))
         return false;
 
     if (level == state->root_level) {
-        if (state->root && state->root != table_pa)
+        if ((state->root && state->root != table_pa) ||
+            !sptm_dart_set_ttbr(dart, sid, ((table_pa >> 12) & 0xfffffffcULL) | DART_TTBR_VALID))
             return false;
-
-        u32 ttbr = ((table_pa >> 12) & 0xfffffffcULL) | DART_TTBR_VALID;
-        if (dart->powered) {
-            for (size_t index = 0; index < dart->instance_count; index++) {
-                u64 base = dart->instances[index];
-                if (read32(base + DART_REG_PROTECT) & BIT(0)) {
-                    if (read32(base + DART_TTBR + sid * sizeof(u32)) != ttbr)
-                        return false;
-                } else {
-                    write32(base + DART_TTBR + sid * sizeof(u32), ttbr);
-                }
-            }
-        }
         state->root = table_pa;
         if (!sptm_dart_flush_sid(dart, sid))
             return false;
-        ctx->regs[0] = SPTM_STATUS_SUCCESS;
-        return true;
-    }
-
-    u64 root = 0;
-    u32 root_level = 0;
-    if (sptm_dart_root(dart, sid, &root, &root_level) != 1)
-        return false;
-
-    u64 parent = root;
-    static const u32 shifts[] = {36, 25};
-    for (u32 parent_level = root_level; parent_level < level; parent_level++) {
-        u64 slot = parent + (((dva >> shifts[parent_level]) & 0x7ff) * sizeof(u64));
-        if (!sptm_dart_valid_table(state, slot, sizeof(u64)))
+    } else {
+        u64 slot = sptm_dart_slot(state, dva, level - 1);
+        u64 replacement = sptm_dart_desc(table_pa);
+        u64 old = slot ? read64(slot) : 0;
+        if (!slot || ((old & DART_PTE_VALID) && old != replacement))
             return false;
-
-        if (parent_level == level - 1) {
-            u64 old = read64(sptm_iommu_table_va(slot));
-            u64 replacement =
-                (((table_pa >> SPTM_PAGE_SHIFT) & DART_PTE_OFFSET_MASK) << 10) | DART_PTE_VALID;
-            if ((old & DART_PTE_VALID) && old != replacement)
-                return false;
-
-            write64(sptm_iommu_table_va(slot), replacement);
-            u64 span = BIT(shifts[parent_level]);
-            u64 start = dva & ~(span - 1);
-            if (!sptm_dart_flush_range(dart, sid, start, start + span))
-                return false;
-            ctx->regs[0] = SPTM_STATUS_SUCCESS;
-            return true;
-        }
-
-        u64 descriptor = read64(sptm_iommu_table_va(slot));
-        if (!(descriptor & DART_PTE_VALID))
-            return false;
-        parent = sptm_dart_desc_pa(descriptor);
-        if (!sptm_dart_valid_table(state, parent, SPTM_PAGE_SIZE))
+        write64(slot, replacement);
+        if (!sptm_dart_flush_entry(dart, sid, dva, level - 1))
             return false;
     }
 
-    return false;
+    ctx->regs[0] = SPTM_STATUS_SUCCESS;
+    return true;
 }
 
 static bool sptm_dart_unmap_table(struct exc_info *ctx)
@@ -261,69 +206,30 @@ static bool sptm_dart_unmap_table(struct exc_info *ctx)
     u32 sid = ctx->regs[1];
     u64 dva = ctx->regs[2];
     u32 level = ctx->regs[3];
-    u64 root = 0;
-    u32 root_level = 0;
+    struct sptm_dart_sid *state = sptm_dart_translating_sid(dart, sid);
 
-    if (!dart || level > 2)
-        return false;
-
-    struct sptm_dart_sid *state = sptm_dart_sid(dart, sid);
-    if (!state || !(state->flags & SPTM_DART_SID_KNOWN) ||
-        (state->flags & (SPTM_DART_SID_POLICY | SPTM_DART_SID_EXCLAVE)) ||
-        !(state->tcr & DART_TCR_TRANSLATE))
-        return false;
-    root_level = state->root_level;
-    if (level < root_level || !state->root ||
+    if (!state || level > 2 || level < state->root_level || !state->root ||
         !sptm_dart_valid_table(state, state->root, SPTM_PAGE_SIZE) ||
         !sptm_dart_validate_dva(state, dva, 1))
         return false;
-    root = state->root;
 
-    if (level == root_level) {
-        if (dart->powered) {
-            for (size_t index = 0; index < dart->instance_count; index++) {
-                u64 base = dart->instances[index];
-                if (read32(base + DART_REG_PROTECT) & BIT(0)) {
-                    if (read32(base + DART_TTBR + sid * sizeof(u32)))
-                        return false;
-                } else {
-                    write32(base + DART_TTBR + sid * sizeof(u32), 0);
-                }
-            }
-        }
+    if (level == state->root_level) {
+        if (!sptm_dart_set_ttbr(dart, sid, 0))
+            return false;
         state->root = 0;
         if (!sptm_dart_flush_sid(dart, sid))
             return false;
-        ctx->regs[0] = SPTM_STATUS_SUCCESS;
-        return true;
-    }
-
-    static const u32 shifts[] = {36, 25};
-    u64 parent = root;
-    for (u32 parent_level = root_level; parent_level < level; parent_level++) {
-        u64 slot = parent + (((dva >> shifts[parent_level]) & 0x7ff) * sizeof(u64));
-        if (!sptm_dart_valid_table(state, slot, sizeof(u64)))
+    } else {
+        u64 slot = sptm_dart_slot(state, dva, level - 1);
+        if (!slot || !(read64(slot) & DART_PTE_VALID))
             return false;
-        if (parent_level == level - 1) {
-            if (!(read64(sptm_iommu_table_va(slot)) & DART_PTE_VALID))
-                return false;
-            write64(sptm_iommu_table_va(slot), 0);
-            u64 span = BIT(shifts[parent_level]);
-            u64 start = dva & ~(span - 1);
-            if (!sptm_dart_flush_range(dart, sid, start, start + span))
-                return false;
-            ctx->regs[0] = SPTM_STATUS_SUCCESS;
-            return true;
-        }
-        u64 descriptor = read64(sptm_iommu_table_va(slot));
-        if (!(descriptor & DART_PTE_VALID))
-            return false;
-        parent = sptm_dart_desc_pa(descriptor);
-        if (!sptm_dart_valid_table(state, parent, SPTM_PAGE_SIZE))
+        write64(slot, 0);
+        if (!sptm_dart_flush_entry(dart, sid, dva, level - 1))
             return false;
     }
 
-    return false;
+    ctx->regs[0] = SPTM_STATUS_SUCCESS;
+    return true;
 }
 
 static bool sptm_dart_page_range(u64 dva, u64 size, u64 *start, u64 *end, size_t *count)
@@ -344,6 +250,23 @@ static bool sptm_dart_page_range(u64 dva, u64 size, u64 *start, u64 *end, size_t
     return *count <= SPTM_MAX_DART_PAGES;
 }
 
+static u64 sptm_dart_page_pte(const struct sptm_dart *dart, u64 dva, u64 size, u64 page_dva,
+                              u64 target, u64 options)
+{
+    // Restrict the leaf to the 4-byte subpages inside [dva, dva + size).
+    u64 sp_start = (max(dva, page_dva) - page_dva) >> 2;
+    u64 sp_end = (min(dva + size, page_dva + SPTM_PAGE_SIZE) - page_dva - 1) >> 2;
+    bool wrprot = options & BIT(1);
+    u8 *frame = sptm_frame_entry(target);
+    if (frame && (dart->flags & SPTM_DART_RELAXED_RW))
+        wrprot |= frame[2] == 14 || frame[2] == 15 || frame[2] == 16 ||
+                  frame[2] == SPTM_FRAME_COPROCESSOR_RO_IO;
+
+    return ((sp_start & 0xfff) << 52) | ((sp_end & 0xfff) << 40) | sptm_dart_desc(target) |
+           (options & BIT(0) ? DART_PTE_RDPROT : 0) | (wrprot ? DART_PTE_WRPROT : 0) |
+           (options & BIT(2) ? DART_PTE_UNCACHABLE : 0);
+}
+
 static bool sptm_dart_map_pages(struct exc_info *ctx)
 {
     struct sptm_dart *dart = sptm_find_dart(ctx->regs[0]);
@@ -351,24 +274,17 @@ static bool sptm_dart_map_pages(struct exc_info *ctx)
     u64 dva = ctx->regs[2];
     u64 size = ctx->regs[4];
     u64 options = ctx->regs[5];
-    u64 root = 0, start, end;
-    u32 root_level = 0;
+    struct sptm_dart_sid *state = sptm_dart_translating_sid(dart, sid);
+    u64 start, end;
     size_t count;
-    struct sptm_dart_sid *state;
 
-    if (!dart || (options & ~0xfULL) || !(state = sptm_dart_sid(dart, sid)) ||
-        sptm_dart_root(dart, sid, &root, &root_level) != 1 ||
+    if (!state || !state->root || (options & ~0xfULL) ||
         !sptm_dart_validate_dva(state, dva, size) ||
         !sptm_dart_page_range(dva, size, &start, &end, &count))
         return false;
 
-    if (!count) {
-        ctx->regs[0] = SPTM_STATUS_SUCCESS;
-        return true;
-    }
-
-    u64 targets = sptm_pointer_pa(ctx->regs[3], count * sizeof(u64));
-    if (!targets)
+    u64 targets = 0;
+    if (count && !(targets = sptm_pointer_pa(ctx->regs[3], count * sizeof(u64))))
         return false;
 
     bool changed = false;
@@ -376,87 +292,42 @@ static bool sptm_dart_map_pages(struct exc_info *ctx)
     for (size_t index = 0; index < count; index++) {
         u64 page_dva = start + index * SPTM_PAGE_SIZE;
         u64 target = read64(targets + index * sizeof(u64));
-        u64 leaf = sptm_dart_leaf(state, root, root_level, page_dva);
-        if ((target & SPTM_PAGE_MASK) || !leaf)
+        u64 slot = sptm_dart_slot(state, page_dva, 2);
+        if ((target & SPTM_PAGE_MASK) || !slot)
             return false;
 
-        u64 valid_start = max(dva, page_dva) - page_dva;
-        u64 valid_end = min(dva + size, page_dva + SPTM_PAGE_SIZE) - page_dva;
-        u64 sp_start = valid_start >> 2;
-        u64 sp_end = (valid_end - 1) >> 2;
-        bool force_wrprot = false;
-        u8 *frame = sptm_frame_entry(target);
-        if (frame && (dart->flags & SPTM_DART_RELAXED_RW)) {
-            switch (frame[2]) {
-                case 14:
-                case 15:
-                case 16:
-                case SPTM_FRAME_COPROCESSOR_RO_IO:
-                    force_wrprot = true;
-                    break;
-            }
-        }
-        u64 pte = ((sp_start & 0xfff) << 52) | ((sp_end & 0xfff) << 40) |
-                  (((target >> SPTM_PAGE_SHIFT) & DART_PTE_OFFSET_MASK) << 10) |
-                  (options & BIT(0) ? DART_PTE_RDPROT : 0) |
-                  ((options & BIT(1)) || force_wrprot ? DART_PTE_WRPROT : 0) |
-                  (options & BIT(2) ? DART_PTE_UNCACHABLE : 0) | DART_PTE_VALID;
-        u64 slot = leaf + (((page_dva >> SPTM_PAGE_SHIFT) & 0x7ff) * sizeof(u64));
-        u64 old = read64(sptm_iommu_table_va(slot));
-        if (old & DART_PTE_VALID)
+        u64 old = read64(slot);
+        if (old & DART_PTE_VALID) {
             all_fresh = false;
-        if ((old & DART_PTE_VALID) && sptm_dart_desc_pa(old) != target) {
-            if (!(options & BIT(3)) || !(old & DART_PTE_WRPROT))
+            // Only write-protected leaves may be retargeted, and only on request.
+            if (sptm_dart_desc_pa(old) != target &&
+                (!(options & BIT(3)) || !(old & DART_PTE_WRPROT)))
                 return false;
         }
-        changed |= old != pte;
+        changed |= old != sptm_dart_page_pte(dart, dva, size, page_dva, target, options);
     }
 
     // Pin every replacement target before publishing the batch.
-    size_t refs_prepared = 0;
-    for (size_t index = 0; index < count; index++) {
-        u64 page_dva = start + index * SPTM_PAGE_SIZE;
-        u64 target = read64(targets + index * sizeof(u64));
-        u64 leaf = sptm_dart_leaf(state, root, root_level, page_dva);
-        u64 slot = leaf + (((page_dva >> SPTM_PAGE_SHIFT) & 0x7ff) * sizeof(u64));
-        u64 old = read64(sptm_iommu_table_va(slot));
+    size_t prepared = 0;
+    for (; prepared < count; prepared++) {
+        u64 target = read64(targets + prepared * sizeof(u64));
+        u64 old = read64(sptm_dart_slot(state, start + prepared * SPTM_PAGE_SIZE, 2));
         u64 old_target = (old & DART_PTE_VALID) ? sptm_dart_desc_pa(old) : 0;
-
-        if (old_target == target) {
-            refs_prepared = index + 1;
+        if (old_target == target)
             continue;
-        }
         if (!sptm_adjust_iommu_use(target, 1))
-            goto rollback_dart_map_refs;
+            goto rollback;
         if (old_target && !sptm_adjust_iommu_use(old_target, -1)) {
             sptm_adjust_iommu_use(target, -1);
-            goto rollback_dart_map_refs;
+            goto rollback;
         }
-        refs_prepared = index + 1;
     }
 
     for (size_t index = 0; index < count; index++) {
         u64 page_dva = start + index * SPTM_PAGE_SIZE;
         u64 target = read64(targets + index * sizeof(u64));
-        u64 valid_start = max(dva, page_dva) - page_dva;
-        u64 valid_end = min(dva + size, page_dva + SPTM_PAGE_SIZE) - page_dva;
-        u64 sp_start = valid_start >> 2;
-        u64 sp_end = (valid_end - 1) >> 2;
-        bool force_wrprot = false;
-        u8 *frame = sptm_frame_entry(target);
-        if (frame && (dart->flags & SPTM_DART_RELAXED_RW)) {
-            u8 type = frame[2];
-            force_wrprot |=
-                type == 14 || type == 15 || type == 16 || type == SPTM_FRAME_COPROCESSOR_RO_IO;
-        }
-        u64 pte = ((sp_start & 0xfff) << 52) | ((sp_end & 0xfff) << 40) |
-                  (((target >> SPTM_PAGE_SHIFT) & DART_PTE_OFFSET_MASK) << 10) |
-                  (options & BIT(0) ? DART_PTE_RDPROT : 0) |
-                  ((options & BIT(1)) || force_wrprot ? DART_PTE_WRPROT : 0) |
-                  (options & BIT(2) ? DART_PTE_UNCACHABLE : 0) | DART_PTE_VALID;
-        u64 leaf = sptm_dart_leaf(state, root, root_level, page_dva);
-        u64 slot = leaf + (((page_dva >> SPTM_PAGE_SHIFT) & 0x7ff) * sizeof(u64));
-        write64(sptm_iommu_table_va(slot), pte);
+        write64(sptm_dart_slot(state, page_dva, 2),
+                sptm_dart_page_pte(dart, dva, size, page_dva, target, options));
     }
     sysop("dsb sy");
     bool skip_fresh = (dart->flags & SPTM_DART_AVOID_MAP_TLBI) && all_fresh;
@@ -466,13 +337,10 @@ static bool sptm_dart_map_pages(struct exc_info *ctx)
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
 
-rollback_dart_map_refs:
-    for (size_t index = 0; index < refs_prepared; index++) {
-        u64 page_dva = start + index * SPTM_PAGE_SIZE;
+rollback:
+    for (size_t index = 0; index < prepared; index++) {
         u64 target = read64(targets + index * sizeof(u64));
-        u64 leaf = sptm_dart_leaf(state, root, root_level, page_dva);
-        u64 slot = leaf + (((page_dva >> SPTM_PAGE_SHIFT) & 0x7ff) * sizeof(u64));
-        u64 old = read64(sptm_iommu_table_va(slot));
+        u64 old = read64(sptm_dart_slot(state, start + index * SPTM_PAGE_SIZE, 2));
         u64 old_target = (old & DART_PTE_VALID) ? sptm_dart_desc_pa(old) : 0;
         if (old_target == target)
             continue;
@@ -487,29 +355,25 @@ static bool sptm_dart_unmap_pages(struct exc_info *ctx)
 {
     struct sptm_dart *dart = sptm_find_dart(ctx->regs[0]);
     u32 sid = ctx->regs[1];
-    u64 root = 0, start, end;
-    u32 root_level = 0;
-    size_t count;
-    struct sptm_dart_sid *state;
     u64 dva = ctx->regs[2];
     u64 size = ctx->regs[3];
     u64 options = ctx->regs[4];
+    struct sptm_dart_sid *state = sptm_dart_translating_sid(dart, sid);
+    u64 start, end;
+    size_t count;
 
-    if (!dart || (options & ~3ULL) ||
+    if (!state || !state->root || (options & ~3ULL) ||
         ((options & BIT(0)) && !(dart->flags & SPTM_DART_ALLOW_PTE_REMAP)) ||
-        !(state = sptm_dart_sid(dart, sid)) || sptm_dart_root(dart, sid, &root, &root_level) != 1 ||
         !sptm_dart_validate_dva(state, dva, size) ||
         !sptm_dart_page_range(dva, size, &start, &end, &count))
         return false;
 
     bool changed = false;
     for (size_t index = 0; index < count; index++) {
-        u64 page_dva = start + index * SPTM_PAGE_SIZE;
-        u64 leaf = sptm_dart_leaf(state, root, root_level, page_dva);
-        if (!leaf)
+        u64 slot = sptm_dart_slot(state, start + index * SPTM_PAGE_SIZE, 2);
+        if (!slot)
             return false;
-        u64 slot = leaf + (((page_dva >> SPTM_PAGE_SHIFT) & 0x7ff) * sizeof(u64));
-        u64 old = read64(sptm_iommu_table_va(slot));
+        u64 old = read64(slot);
         if (!(old & DART_PTE_VALID)) {
             if (!(options & BIT(1)))
                 return false;
@@ -521,44 +385,27 @@ static bool sptm_dart_unmap_pages(struct exc_info *ctx)
         changed = true;
     }
 
-    size_t refs_released = 0;
-    for (size_t index = 0; index < count; index++) {
-        u64 page_dva = start + index * SPTM_PAGE_SIZE;
-        u64 leaf = sptm_dart_leaf(state, root, root_level, page_dva);
-        u64 slot = leaf + (((page_dva >> SPTM_PAGE_SHIFT) & 0x7ff) * sizeof(u64));
-        u64 old = read64(sptm_iommu_table_va(slot));
-        if (!(old & DART_PTE_VALID)) {
-            refs_released = index + 1;
-            continue;
-        }
+    size_t released = 0;
+    for (; released < count; released++) {
+        u64 old = read64(sptm_dart_slot(state, start + released * SPTM_PAGE_SIZE, 2));
         u64 target = sptm_dart_desc_pa(old);
-        if (!target || !sptm_adjust_iommu_use(target, -1))
-            goto rollback_dart_unmap_refs;
-        refs_released = index + 1;
+        if ((old & DART_PTE_VALID) && (!target || !sptm_adjust_iommu_use(target, -1)))
+            goto rollback;
     }
 
-    for (size_t index = 0; index < count; index++) {
-        u64 page_dva = start + index * SPTM_PAGE_SIZE;
-        u64 leaf = sptm_dart_leaf(state, root, root_level, page_dva);
-        u64 slot = leaf + (((page_dva >> SPTM_PAGE_SHIFT) & 0x7ff) * sizeof(u64));
-        write64(sptm_iommu_table_va(slot), 0);
-    }
+    for (size_t index = 0; index < count; index++)
+        write64(sptm_dart_slot(state, start + index * SPTM_PAGE_SIZE, 2), 0);
     sysop("dsb sy");
     if (changed && !sptm_dart_flush_range(dart, sid, start, end))
         return false;
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
 
-rollback_dart_unmap_refs:
-    for (size_t index = 0; index < refs_released; index++) {
-        u64 page_dva = start + index * SPTM_PAGE_SIZE;
-        u64 leaf = sptm_dart_leaf(state, root, root_level, page_dva);
-        u64 slot = leaf + (((page_dva >> SPTM_PAGE_SHIFT) & 0x7ff) * sizeof(u64));
-        u64 old = read64(sptm_iommu_table_va(slot));
-        if (!(old & DART_PTE_VALID))
-            continue;
+rollback:
+    for (size_t index = 0; index < released; index++) {
+        u64 old = read64(sptm_dart_slot(state, start + index * SPTM_PAGE_SIZE, 2));
         u64 target = sptm_dart_desc_pa(old);
-        if (target)
+        if ((old & DART_PTE_VALID) && target)
             sptm_adjust_iommu_use(target, 1);
     }
     return false;
@@ -568,31 +415,20 @@ static bool sptm_dart_set_stream(struct exc_info *ctx, bool enable)
 {
     struct sptm_dart *dart = sptm_find_dart(ctx->regs[0]);
     u32 sid = ctx->regs[1];
-    struct sptm_dart_sid *state;
-    if (!dart || sid >= dart->sid_count)
-        return false;
-    state = sptm_dart_sid(dart, sid);
+    struct sptm_dart_sid *state = dart ? sptm_dart_sid(dart, sid) : NULL;
     if (!state || !(state->flags & SPTM_DART_SID_KNOWN) || (state->flags & SPTM_DART_SID_EXCLAVE))
         return false;
-    if (!(state->tcr & DART_TCR_TRANSLATE)) {
-        ctx->regs[0] = SPTM_STATUS_SUCCESS;
-        return true;
-    }
 
-    if (!enable && (dart->flags & SPTM_DART_RETENTION)) {
-        ctx->regs[0] = SPTM_STATUS_SUCCESS;
-        return true;
-    }
-
-    u32 word = sid / 32;
-    u32 bit = BIT(sid % 32);
-    if (dart->powered) {
-        u64 register_offset = enable ? DART_ENABLE_STREAMS : DART_DISABLE_STREAMS;
-        for (size_t index = 0; index < dart->instance_count; index++)
-            write32(dart->instances[index] + register_offset + word * sizeof(u32), bit);
-    } else {
-        /* Endpoint 5 will restore the deferred stream state after power-up. */
-        if (dart->saved_valid) {
+    // Non-translating SIDs keep their streams, and retention DARTs keep them enabled.
+    if ((state->tcr & DART_TCR_TRANSLATE) && (enable || !(dart->flags & SPTM_DART_RETENTION))) {
+        u32 word = sid / 32;
+        u32 bit = BIT(sid % 32);
+        if (dart->powered) {
+            u64 offset = (enable ? DART_ENABLE_STREAMS : DART_DISABLE_STREAMS) + word * sizeof(u32);
+            for (size_t index = 0; index < dart->instance_count; index++)
+                write32(dart->instances[index] + offset, bit);
+        } else if (dart->saved_valid) {
+            /* Power-up restores the deferred stream state. */
             for (size_t index = 0; index < dart->instance_count; index++) {
                 if (enable)
                     dart->saved_streams[index][word] |= bit;
@@ -600,9 +436,9 @@ static bool sptm_dart_set_stream(struct exc_info *ctx, bool enable)
                     dart->saved_streams[index][word] &= ~bit;
             }
         }
+        sysop("dsb sy");
     }
 
-    sysop("dsb sy");
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
 }
@@ -639,8 +475,9 @@ bool sptm_handle_dart(struct exc_info *ctx, u32 endpoint)
         case 8: /* ENABLE_TRANSLATION */
             handled = sptm_dart_set_stream(ctx, true);
             break;
-        default:
-            handled = sptm_dart_error_endpoint(ctx);
+        default: /* The remaining endpoints, including error clearing, are no-ops. */
+            ctx->regs[0] = SPTM_STATUS_SUCCESS;
+            handled = true;
             break;
     }
     spin_unlock(&sptm.service_lock);
@@ -650,7 +487,7 @@ bool sptm_handle_dart(struct exc_info *ctx, u32 endpoint)
 void sptm_dart_configure(const struct sptm_dart_config *config)
 {
     u32 id = config->id;
-    if (!sptm.enabled || !config->sid_count || config->sid_count > SPTM_MAX_DART_SIDS) {
+    if (!config->sid_count || config->sid_count > SPTM_MAX_DART_SIDS) {
         printf("HV: refusing invalid SPTM DART %u configuration\n", id);
         return;
     }

@@ -2,6 +2,10 @@
 
 #include "hv_sptm_internal.h"
 
+static const u16 sptm_dart_counter_offsets[] = {
+    0x760, 0x764, 0x768, 0x770, 0x774, 0x778, 0x780, 0x784, 0x788,
+};
+
 static bool sptm_dart_clear_errors(const struct sptm_dart *dart)
 {
     for (size_t index = 0; index < dart->instance_count; index++) {
@@ -127,66 +131,69 @@ static bool sptm_dart_powerup_sidebands(struct sptm_dart *dart)
     return true;
 }
 
+static u64 sptm_dart_read_sized(u64 address, u32 size)
+{
+    switch (size) {
+        case 1:
+            return read8(address);
+        case 2:
+            return read16(address);
+        case 4:
+            return read32(address);
+        default:
+            return read64(address);
+    }
+}
+
+static void sptm_dart_write_sized(u64 address, u32 size, u64 value)
+{
+    switch (size) {
+        case 1:
+            write8(address, value);
+            break;
+        case 2:
+            write16(address, value);
+            break;
+        case 4:
+            write32(address, value);
+            break;
+        default:
+            write64(address, value);
+            break;
+    }
+}
+
 static bool sptm_dart_apply_tunables(const struct sptm_dart *dart)
 {
     if (!dart->tunable_count)
         return true;
     for (size_t index = 0; index < dart->tunable_count; index++) {
+        // Bases come from this DART's instances; sizes and offsets come from the ADT.
         const struct sptm_dart_tunable *entry = &dart->tunable_entries[index];
-        bool known_base = false;
-        for (size_t instance = 0; instance < dart->instance_count; instance++)
-            known_base |= entry->base == dart->instances[instance];
-        if (!known_base ||
-            (entry->size != 1 && entry->size != 2 && entry->size != 4 && entry->size != 8) ||
+        if ((entry->size != 1 && entry->size != 2 && entry->size != 4 && entry->size != 8) ||
             (entry->offset & (entry->size - 1)) || entry->offset > 0x10000 - entry->size)
+            return false;
+        u64 width_mask = entry->size == 8 ? UINT64_MAX : BIT(entry->size * 8) - 1;
+        if ((entry->mask | entry->value) & ~width_mask)
             return false;
 
         u64 address = entry->base + entry->offset;
-        u64 old, current, width_mask;
-        switch (entry->size) {
-            case 1:
-                width_mask = UINT8_MAX;
-                old = read8(address);
-                if ((old & entry->mask) != (entry->value & entry->mask))
-                    write8(address, (old & ~entry->mask) | (entry->value & entry->mask));
-                current = read8(address);
-                break;
-            case 2:
-                width_mask = UINT16_MAX;
-                old = read16(address);
-                if ((old & entry->mask) != (entry->value & entry->mask))
-                    write16(address, (old & ~entry->mask) | (entry->value & entry->mask));
-                current = read16(address);
-                break;
-            case 4:
-                width_mask = UINT32_MAX;
-                old = read32(address);
-                if ((old & entry->mask) != (entry->value & entry->mask))
-                    write32(address, (old & ~entry->mask) | (entry->value & entry->mask));
-                current = read32(address);
-                break;
-            case 8:
-                width_mask = UINT64_MAX;
-                old = read64(address);
-                if ((old & entry->mask) != (entry->value & entry->mask))
-                    write64(address, (old & ~entry->mask) | (entry->value & entry->mask));
-                current = read64(address);
-                break;
-            default:
-                __builtin_unreachable();
+        u64 wanted = entry->value & entry->mask;
+        u64 current = sptm_dart_read_sized(address, entry->size);
+        if ((current & entry->mask) != wanted) {
+            sptm_dart_write_sized(address, entry->size, (current & ~entry->mask) | wanted);
+            if ((sptm_dart_read_sized(address, entry->size) & entry->mask) != wanted)
+                return false;
         }
-        if (((entry->mask | entry->value) & ~width_mask) ||
-            (current & entry->mask) != (entry->value & entry->mask))
-            return false;
     }
     sysop("dsb sy");
     return true;
 }
 
-static bool sptm_dart_program_dapf(const struct sptm_dart *dart)
+static void sptm_dart_program_dapf(const struct sptm_dart *dart)
 {
     if (!dart->dapf_count)
-        return true;
+        return;
     for (size_t index = 0; index < dart->dapf_count; index++) {
         const struct sptm_dart_dapf *entry = &dart->dapf_entries[index];
         write32(entry->base + 0x04, entry->r4);
@@ -196,7 +203,6 @@ static bool sptm_dart_program_dapf(const struct sptm_dart *dart)
         write32(entry->base + 0x20, entry->r20);
     }
     sysop("dsb sy");
-    return true;
 }
 
 static void sptm_dart_powerdown_sidebands(struct sptm_dart *dart)
@@ -302,10 +308,6 @@ static bool sptm_dart_discover(struct sptm_dart *dart)
 
 static bool sptm_dart_save_power_state(struct sptm_dart *dart)
 {
-    static const u16 counter_offsets[] = {
-        0x760, 0x764, 0x768, 0x770, 0x774, 0x778, 0x780, 0x784, 0x788,
-    };
-
     for (size_t index = 0; index < dart->instance_count; index++) {
         u64 base = dart->instances[index];
         for (size_t word = 0; word < dart->sid_words; word++) {
@@ -315,7 +317,8 @@ static bool sptm_dart_save_power_state(struct sptm_dart *dart)
             dart->saved_streams[index][word] = streams;
         }
         for (size_t counter = 0; counter < dart->counter_count; counter++)
-            dart->saved_counters[index][counter] = read32(base + counter_offsets[counter]);
+            dart->saved_counters[index][counter] =
+                read32(base + sptm_dart_counter_offsets[counter]);
     }
     dart->saved_valid = true;
     return true;
@@ -342,10 +345,6 @@ static void sptm_dart_disable_translating_streams(struct sptm_dart *dart)
 
 static void sptm_dart_restore_runtime_state(struct sptm_dart *dart)
 {
-    static const u16 counter_offsets[] = {
-        0x760, 0x764, 0x768, 0x770, 0x774, 0x778, 0x780, 0x784, 0x788,
-    };
-
     for (size_t index = 0; index < dart->instance_count; index++) {
         u64 base = dart->instances[index];
         if (dart->limits_valid && dart->saved_valid) {
@@ -354,7 +353,8 @@ static void sptm_dart_restore_runtime_state(struct sptm_dart *dart)
         }
         if (dart->saved_valid) {
             for (size_t counter = 0; counter < dart->counter_count; counter++)
-                write32(base + counter_offsets[counter], dart->saved_counters[index][counter]);
+                write32(base + sptm_dart_counter_offsets[counter],
+                        dart->saved_counters[index][counter]);
         }
         for (size_t word = 0; word < dart->sid_words; word++) {
             u32 streams =
@@ -389,7 +389,8 @@ bool sptm_dart_power(struct exc_info *ctx, bool power_up)
             }
             dart->limits_valid = true;
         }
-        if (!sptm_dart_program_dapf(dart) || !sptm_dart_clear_errors(dart))
+        sptm_dart_program_dapf(dart);
+        if (!sptm_dart_clear_errors(dart))
             return false;
         sptm_dart_restore_runtime_state(dart);
     } else {
@@ -411,16 +412,8 @@ bool sptm_dart_power(struct exc_info *ctx, bool power_up)
 bool sptm_dart_init(struct exc_info *ctx)
 {
     struct sptm_dart *dart = sptm_find_dart(ctx->regs[0]);
-    if (!dart)
+    if (!dart || !sptm_dart_discover(dart))
         return false;
-    if (!sptm_dart_discover(dart))
-        return false;
-    ctx->regs[0] = SPTM_STATUS_SUCCESS;
-    return true;
-}
-
-bool sptm_dart_error_endpoint(struct exc_info *ctx)
-{
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
 }

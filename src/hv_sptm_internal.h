@@ -455,7 +455,6 @@ struct sptm_dart_sid *sptm_dart_sid(const struct sptm_dart *dart, u32 sid);
 bool sptm_dart_valid_table(const struct sptm_dart_sid *state, u64 pa, size_t size);
 bool sptm_dart_power(struct exc_info *ctx, bool power_up);
 bool sptm_dart_init(struct exc_info *ctx);
-bool sptm_dart_error_endpoint(struct exc_info *ctx);
 bool sptm_handle_dart(struct exc_info *ctx, u32 endpoint);
 void sptm_dart_configure(const struct sptm_dart_config *config);
 
