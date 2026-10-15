@@ -8,7 +8,7 @@ static bool sptm_uat_valid_table(u64 pa)
         return false;
     if (sptm_valid_pa(pa, SPTM_PAGE_SIZE))
         return true;
-    return pa == sptm.uat_shared_l2_pa && sptm.uat_shared_l2_size == SPTM_PAGE_SIZE;
+    return pa == sptm.uat_shared_l2_pa;
 }
 
 static bool sptm_uat_sentinel(u64 root)
@@ -181,7 +181,7 @@ static bool sptm_uat_ref_table(u64 pa, int delta)
 static bool sptm_uat_ref_parent(u64 pa, int delta)
 {
     pa &= SPTM_DESC_PA_MASK_16K;
-    if (pa == sptm.uat_shared_l2_pa && sptm.uat_shared_l2_size == SPTM_PAGE_SIZE)
+    if (pa == sptm.uat_shared_l2_pa)
         return true;
     return sptm_uat_ref_table(pa, delta);
 }
@@ -201,7 +201,7 @@ static bool sptm_uat_table_refs_can_release(u64 child_pa, u64 parent_pa)
     if (!child_refs)
         return false;
 
-    if (parent_pa == sptm.uat_shared_l2_pa && sptm.uat_shared_l2_size == SPTM_PAGE_SIZE)
+    if (parent_pa == sptm.uat_shared_l2_pa)
         return true;
 
     u8 *parent = sptm_frame_entry(parent_pa);
@@ -396,7 +396,7 @@ static bool sptm_uat_unmap_table(struct exc_info *ctx)
     u64 parent_pa = slot & ~(REGION_NORMAL_NC | SPTM_PAGE_MASK);
 
     // The firmware-owned shared L2 cannot be removed or recreated.
-    if (table_pa == sptm.uat_shared_l2_pa && sptm.uat_shared_l2_size == SPTM_PAGE_SIZE)
+    if (table_pa == sptm.uat_shared_l2_pa)
         return false;
     if (!sptm_uat_table_refs_can_release(table_pa, parent_pa))
         return false;
@@ -999,95 +999,53 @@ bool sptm_handle_uat(struct exc_info *ctx, u32 endpoint)
     return handled;
 }
 
-void hv_sptm_configure_uat(u64 shared_l2_pa, u64 shared_l2_size, u64 info, u64 global_state,
-                           u64 gpu_contexts, u64 shared_l2_va)
+static void sptm_uat_init_handoff(u64 handoff_pa, u64 handoff_size)
 {
-    u32 mode = info & 0xff;
-    u32 va_width = (info >> 8) & 0xff;
-    u32 segment_limit = (info >> 16) & 0xffff;
-    u32 mapping_limit = (info >> 32) & 0xffff;
-    bool tlbi_at_retype = info & BIT(48);
-    u64 state_size = UAT_STATE_UNMAP_SEGMENTS + segment_limit * sizeof(struct sptm_uat_segment);
-    u64 global_state_pa = sptm_pointer_pa(global_state, SPTM_PAGE_SIZE);
-    u64 global_root_pa = global_state_pa
-                             ? read64(global_state_pa + UAT_STATE_ROOT1) & SPTM_DESC_PA_MASK_16K
-                             : 0;
-    u8 *global_root_entry = sptm_frame_entry(global_root_pa);
-    u64 global_root_va = global_root_pa
-                             ? sptm.physmap_base + global_root_pa - sptm.managed_start
-                             : 0;
-    u64 global_root_slot = global_root_pa
-                               ? sptm_walk(sptm.kernel_root, global_root_va, 3, NULL)
-                               : 0;
-    u64 global_root_descriptor = global_root_slot ? read64(global_root_slot) : 0;
-    u64 shared_l2_slot = sptm_walk(sptm.kernel_root, shared_l2_va, 3, NULL);
-    u64 shared_l2_descriptor = shared_l2_slot ? read64(shared_l2_slot) : 0;
-    if (!sptm.enabled || (shared_l2_pa & SPTM_PAGE_MASK) || shared_l2_size != SPTM_PAGE_SIZE ||
-        !sptm_valid_platform_pa(shared_l2_pa, shared_l2_size) || va_width < 37 || va_width > 48 ||
-        mode > 1 || !segment_limit || !mapping_limit || info >> 49 || state_size > SPTM_PAGE_SIZE ||
-        !global_state_pa || (gpu_contexts & (2 * sizeof(u64) - 1)) ||
-        !sptm_valid_platform_pa(gpu_contexts, 64 * 2 * sizeof(u64)) ||
-        read8(global_state_pa) != (mode ? UAT_STATE_GLOBAL_MODE1 : UAT_STATE_GLOBAL_MODE0) ||
-        !sptm_valid_pa(global_root_pa, SPTM_PAGE_SIZE) || !global_root_entry ||
-        global_root_entry[2] != SPTM_FRAME_XNU_IOMMU || !(global_root_descriptor & 1) ||
-        (global_root_descriptor & SPTM_DESC_PA_MASK_16K) != global_root_pa ||
-        (global_root_descriptor & ((7ULL << 2) | (3ULL << 8))) != PTE_MAIR_IDX(1) ||
-        (shared_l2_va & SPTM_PAGE_MASK) || !(shared_l2_descriptor & 1) ||
-        (shared_l2_descriptor & SPTM_DESC_PA_MASK_16K) != shared_l2_pa ||
-        (shared_l2_descriptor & ((7ULL << 2) | (3ULL << 8))) != PTE_MAIR_IDX(1)) {
-        printf("HV: refusing invalid SPTM UAT configuration\n");
-        return;
-    }
-
-    // Boot-seeded UAT tables bypass RETYPE, so retire their WB aliases here.
-    u64 host_pages[] = {global_root_pa, shared_l2_pa};
-    mmu_map_ram_pages_nc(host_pages, ARRAY_SIZE(host_pages), true);
-
-    sptm.uat_global_state = global_state_pa;
-    sptm.uat_gpu_contexts = gpu_contexts;
-    sptm.uat_shared_l2_pa = shared_l2_pa;
-    sptm.uat_shared_l2_size = shared_l2_size;
-    sptm.uat_shared_l2_va = shared_l2_va;
-    sptm.uat_segment_limit = segment_limit;
-    sptm.uat_mapping_limit = mapping_limit;
-    sptm.uat_state_size = state_size;
-    sptm.uat_va_width = va_width;
-    sptm.uat_mode = mode;
-    sptm.uat_tlbi_at_retype = tlbi_at_retype;
-    sptm.uat_configured = true;
-}
-
-void hv_sptm_configure_uat_handoff(u64 handoff_pa, u64 handoff_size)
-{
-    if (!sptm.uat_configured || !handoff_pa || (handoff_pa & SPTM_PAGE_MASK) ||
-        handoff_size < UAT_HANDOFF_MIN_SIZE || (handoff_size & SPTM_PAGE_MASK) ||
-        !sptm_valid_platform_pa(handoff_pa, handoff_size)) {
-        printf("HV: refusing invalid SPTM UAT handoff configuration "
-               "0x%lx+0x%lx\n",
-               handoff_pa, handoff_size);
+    if (!handoff_pa || (handoff_pa & SPTM_PAGE_MASK) || handoff_size < UAT_HANDOFF_MIN_SIZE ||
+        (handoff_size & SPTM_PAGE_MASK) || !sptm_valid_platform_pa(handoff_pa, handoff_size)) {
+        printf("HV: refusing invalid SPTM UAT handoff configuration 0x%lx+0x%lx\n", handoff_pa,
+               handoff_size);
         return;
     }
 
     sptm.uat_handoff_pa = handoff_pa;
-
-    u64 handoff = sptm.uat_handoff_pa;
     // GFXHandoff still exposes CUR_CTX under its historical UNK name.
-    write64(handoff + UAT_HANDOFF_MAGIC_AP, 0);
-    write64(handoff + UAT_HANDOFF_MAGIC_FW, 0);
-    write8(handoff + UAT_HANDOFF_LOCK_AP, 0);
-    write8(handoff + UAT_HANDOFF_LOCK_FW, 0);
-    write32(handoff + UAT_HANDOFF_TURN, 0);
-    write32(handoff + UAT_HANDOFF_CURRENT_CTX, UINT32_MAX);
-    memset(sptm.uat_handoff_pending, 0, sizeof(sptm.uat_handoff_pending));
-    memset(sptm.uat_handoff_owner, 0, sizeof(sptm.uat_handoff_owner));
+    write64(handoff_pa + UAT_HANDOFF_MAGIC_AP, 0);
+    write64(handoff_pa + UAT_HANDOFF_MAGIC_FW, 0);
+    write8(handoff_pa + UAT_HANDOFF_LOCK_AP, 0);
+    write8(handoff_pa + UAT_HANDOFF_LOCK_FW, 0);
+    write32(handoff_pa + UAT_HANDOFF_TURN, 0);
+    write32(handoff_pa + UAT_HANDOFF_CURRENT_CTX, UINT32_MAX);
     for (u32 slot = 0; slot < UAT_HANDOFF_SLOT_COUNT; slot++) {
         u64 slot_addr = sptm_uat_handoff_slot_addr(slot);
         write64(slot_addr + UAT_HANDOFF_SLOT_STATE, 0);
         write64(slot_addr + UAT_HANDOFF_SLOT_ADDR, 0);
         write64(slot_addr + UAT_HANDOFF_SLOT_SIZE, 0);
     }
-    write64(handoff + UAT_HANDOFF_UNK3, 0);
+    write64(handoff_pa + UAT_HANDOFF_UNK3, 0);
     sysop("dsb osh");
-    write64(handoff + UAT_HANDOFF_MAGIC_AP, UAT_HANDOFF_MAGIC);
+    write64(handoff_pa + UAT_HANDOFF_MAGIC_AP, UAT_HANDOFF_MAGIC);
     sysop("dsb osh");
+}
+
+// Boot fills in the UAT parameters; leave UAT disabled if the device tree is unusable.
+void sptm_uat_configure(u64 global_root_pa, u64 shared_l2_size, u64 handoff_pa, u64 handoff_size)
+{
+    sptm.uat_state_size =
+        UAT_STATE_UNMAP_SEGMENTS + sptm.uat_segment_limit * sizeof(struct sptm_uat_segment);
+    if ((sptm.uat_shared_l2_pa & SPTM_PAGE_MASK) || shared_l2_size != SPTM_PAGE_SIZE ||
+        !sptm_valid_platform_pa(sptm.uat_shared_l2_pa, shared_l2_size) || sptm.uat_va_width < 37 ||
+        sptm.uat_va_width > 48 || sptm.uat_mode > 1 || !sptm.uat_segment_limit ||
+        !sptm.uat_mapping_limit || sptm.uat_state_size > SPTM_PAGE_SIZE ||
+        (sptm.uat_gpu_contexts & (2 * sizeof(u64) - 1)) ||
+        !sptm_valid_platform_pa(sptm.uat_gpu_contexts, 64 * 2 * sizeof(u64))) {
+        printf("HV: refusing invalid SPTM UAT configuration\n");
+        return;
+    }
+
+    // Boot-seeded UAT tables bypass RETYPE, so retire their WB aliases here.
+    u64 host_pages[] = {global_root_pa, sptm.uat_shared_l2_pa};
+    mmu_map_ram_pages_nc(host_pages, ARRAY_SIZE(host_pages), true);
+    sptm.uat_configured = true;
+    sptm_uat_init_handoff(handoff_pa, handoff_size);
 }

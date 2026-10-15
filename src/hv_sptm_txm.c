@@ -21,8 +21,6 @@ bool sptm_handle_txm(struct exc_info *ctx, u32 endpoint)
             word_count = 3;
             break;
         case 2:
-            if (!sptm.txm_info_va)
-                return false;
             words[0] = sptm.txm_info_va;
             words[1] = sptm.txm_info_va + 0x318;
             words[5] = sptm.txm_info_va;
@@ -113,14 +111,4 @@ bool sptm_handle_txm(struct exc_info *ctx, u32 endpoint)
     sysop("dsb sy");
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
-}
-
-void hv_sptm_configure_txm(u64 info_va)
-{
-    if (!sptm.enabled || !sptm_pointer_pa(info_va, SPTM_PAGE_SIZE)) {
-        printf("HV: refusing invalid SPTM TXM configuration 0x%lx\n", info_va);
-        return;
-    }
-
-    sptm.txm_info_va = info_va;
 }

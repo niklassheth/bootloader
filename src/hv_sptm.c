@@ -10,25 +10,10 @@
 #define SPTM_PANIC_FLAG_OFFSET      0
 #define SPTM_PANIC_CPU_OFFSET       8
 #define SPTM_PANIC_DOMAIN_OFFSET    12
-#define SPTM_PANIC_STATE_SIZE       13
-u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text)
-{
-    return sptm_boot_init(guest_adt, cons_ops, page_shift_const, xnu_text);
-}
-
-void hv_sptm_configure_panic(u64 state_pa)
-{
-    if (!sptm.enabled || (state_pa & 7) || !sptm_valid_pa(state_pa, SPTM_PANIC_STATE_SIZE)) {
-        printf("HV: refusing invalid SPTM panic-state configuration\n");
-        return;
-    }
-
-    sptm.panic_state_pa = state_pa;
-}
 
 static bool sptm_handle_xnu_panic_begin(struct exc_info *ctx)
 {
-    if (!sptm.panic_state_pa || ctx->cpu_id >= sptm.max_cpus)
+    if (ctx->cpu_id >= sptm.max_cpus)
         return false;
 
     struct sptm_cpu *cpu = sptm_find_cpu(sptm.hv_phys_ids[ctx->cpu_id]);

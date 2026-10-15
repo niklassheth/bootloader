@@ -124,9 +124,6 @@ static bool sptm_sart_unmap(struct exc_info *ctx)
 
 bool sptm_handle_sart(struct exc_info *ctx, u32 endpoint)
 {
-    if (!sptm.sart_configured)
-        return false;
-
     switch (endpoint) {
         case 0:
             if (ctx->regs[0] > 1)
@@ -140,18 +137,4 @@ bool sptm_handle_sart(struct exc_info *ctx, u32 endpoint)
         default:
             __builtin_unreachable();
     }
-}
-
-void hv_sptm_configure_sart(u64 base, u64 canary, u64 info)
-{
-    if (!sptm.enabled || !base || (base & 3) || (canary & 3) || (info & ~0x1ffffULL)) {
-        printf("HV: refusing invalid SPTM SART configuration\n");
-        return;
-    }
-
-    sptm.sart_base = base;
-    sptm.sart_canary = canary;
-    sptm.sart_protected_mask = info;
-    sptm.sart_exclusive_bounds = info & BIT(16);
-    sptm.sart_configured = true;
 }

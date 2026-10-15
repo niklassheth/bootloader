@@ -304,13 +304,14 @@ static void sptm_init_sart(void)
     u64 base, canary_base = 0;
     adt_get_reg(adt, path, "reg", 0, &base, NULL);
     adt_get_reg(adt, path, "reg", 1, &canary_base, NULL);
-    u64 canary = canary_base + sptm_adt_integer(node, "power-canary-offset", 0);
-    u64 info = sptm_adt_has(node, "exclusive-bounds") ? BIT(16) : 0;
+    sptm.sart_base = base;
+    sptm.sart_canary = canary_base + sptm_adt_integer(node, "power-canary-offset", 0);
+    sptm.sart_exclusive_bounds = sptm_adt_has(node, "exclusive-bounds");
+    // Entries already live at handoff belong to firmware.
     for (u32 index = 0; index < SPTM_SART_ENTRIES; index++) {
         if (read32(base + index * sizeof(u32)) & 0xff)
-            info |= BIT(index);
+            sptm.sart_protected_mask |= BIT(index);
     }
-    hv_sptm_configure_sart(base, canary, info);
 }
 
 static void sptm_init_nvme(struct sptm_allocator *allocator)
@@ -330,48 +331,45 @@ static void sptm_init_nvme(struct sptm_allocator *allocator)
         queue_bar = main_bar;
     }
 
-    u32 queue_entries = sptm_adt_integer(ans, "nvme-queue-entries", 64);
-    u64 tcb_bytes = ALIGN_UP((u64)queue_entries * SPTM_NVME_TCB_SIZE, SPTM_NVME_TCB_ALIGNMENT);
-    u64 prp_bytes = ALIGN_UP((u64)queue_entries * SPTM_NVME_PRP_SLOT_SIZE, SPTM_PAGE_SIZE);
-    void *admin_tcbs = sptm_alloc_zero(allocator, tcb_bytes, SPTM_PAGE_SIZE);
-    void *io_tcbs = sptm_alloc_zero(allocator, tcb_bytes, SPTM_PAGE_SIZE);
-    void *prp_scratch = sptm_alloc_zero(allocator, prp_bytes, SPTM_PAGE_SIZE);
-    void *command_state = sptm_alloc_zero(allocator, queue_entries * SPTM_NVME_COMMAND_SIZE, 16);
+    struct sptm_nvme *nvme = &sptm.nvme;
+    nvme->queue_entries = sptm_adt_integer(ans, "nvme-queue-entries", 64);
+    nvme->tl_wa = sptm_adt_has(ans, "nvme-tl-wa");
+    nvme->tl_slots = nvme->tl_wa ? sptm_adt_integer(ans, "nvme-num-sl", 0) : 0;
+    if (!nvme->queue_entries || (nvme->tl_wa && (!nvme->tl_slots || nvme->tl_slots > 16))) {
+        printf("HV: refusing inconsistent SPTM NVMe configuration\n");
+        return;
+    }
 
-    bool tl_wa = sptm_adt_has(ans, "nvme-tl-wa");
-    bool vdma_wa = sptm_adt_has(ans, "nvme-vdma-wa");
-    bool sha_present = sptm_adt_has(ans, "nvme-ans-sha-present");
-    u8 flags =
-        sptm_adt_has(ans, "nvme-prp-flush-wa") | tl_wa << 1 | vdma_wa << 2 | sha_present << 3;
-    u8 protocol = sptm_adt_has(ans, "nvme-linear-sq") ? 2 : 1;
-    u8 tl_slots = tl_wa ? sptm_adt_integer(ans, "nvme-num-sl", 0) : 0;
-    u64 packed = queue_entries | (u64)protocol << 32 | (u64)flags << 40 | (u64)tl_slots << 48;
+    u64 tcb_bytes = ALIGN_UP(nvme->queue_entries * SPTM_NVME_TCB_SIZE, SPTM_NVME_TCB_ALIGNMENT);
+    u64 prp_bytes = ALIGN_UP(nvme->queue_entries * SPTM_NVME_PRP_SLOT_SIZE, SPTM_PAGE_SIZE);
+    nvme->admin_tcbs = (u64)sptm_alloc_zero(allocator, tcb_bytes, SPTM_PAGE_SIZE);
+    nvme->io_tcbs = (u64)sptm_alloc_zero(allocator, tcb_bytes, SPTM_PAGE_SIZE);
+    nvme->prp_scratch = (u64)sptm_alloc_zero(allocator, prp_bytes, SPTM_PAGE_SIZE);
+    nvme->command_state =
+        (u64)sptm_alloc_zero(allocator, nvme->queue_entries * SPTM_NVME_COMMAND_SIZE, 16);
+
     u64 trusted[2];
     ADT_GETPROP_ARRAY(adt, carveouts, "region-id-55", trusted);
-
-    u64 *config = sptm_alloc_zero(allocator, SPTM_NVME_CONFIG_WORDS * sizeof(*config), 16);
-    config[0] = queue_bar;
-    config[1] = main_bar + 0x28000;
-    config[2] = trusted[0];
-    config[3] = trusted[0] + trusted[1];
-    config[4] = (u64)admin_tcbs;
-    config[5] = (u64)io_tcbs;
-    config[6] = tcb_bytes;
-    config[7] = (u64)prp_scratch;
-    config[8] = (u64)command_state;
-    config[9] = allocator->end;
-    config[10] = packed;
-    if (tl_wa) {
-        adt_get_reg(adt, ans_path, "reg", 10, &config[11], NULL);
-        adt_get_reg(adt, ans_path, "reg", 11, &config[12], NULL);
-        adt_get_reg(adt, ans_path, "reg", 12, &config[13], NULL);
+    nvme->queue_bar = queue_bar;
+    nvme->nvmmu = main_bar + 0x28000;
+    nvme->trusted_start = trusted[0];
+    nvme->trusted_end = trusted[0] + trusted[1];
+    nvme->xnu_managed_start = allocator->end;
+    nvme->xnu_managed_end = sptm.managed_end;
+    nvme->protocol = sptm_adt_has(ans, "nvme-linear-sq") ? 2 : 1;
+    nvme->prp_flush_wa = sptm_adt_has(ans, "nvme-prp-flush-wa");
+    nvme->vdma_wa = sptm_adt_has(ans, "nvme-vdma-wa");
+    nvme->sha_present = sptm_adt_has(ans, "nvme-ans-sha-present");
+    if (nvme->tl_wa) {
+        adt_get_reg(adt, ans_path, "reg", 10, &nvme->tl_mask, NULL);
+        adt_get_reg(adt, ans_path, "reg", 11, &nvme->tl_control, NULL);
+        adt_get_reg(adt, ans_path, "reg", 12, &nvme->tl_status, NULL);
     }
-    if (vdma_wa)
-        adt_get_reg(adt, ans_path, "reg", 13, &config[14], NULL);
-    if (sha_present)
-        adt_get_reg(adt, ans_path, "reg", 14, &config[15], NULL);
-    config[16] = sptm.managed_end;
-    hv_sptm_configure_nvme((u64)config);
+    if (nvme->vdma_wa)
+        adt_get_reg(adt, ans_path, "reg", 13, &nvme->vdma_status, NULL);
+    if (nvme->sha_present)
+        adt_get_reg(adt, ans_path, "reg", 14, &nvme->sha_base, NULL);
+    nvme->configured = true;
 }
 
 // The caller has already switched adt to the guest device tree.

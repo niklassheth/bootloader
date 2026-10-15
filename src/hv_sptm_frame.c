@@ -209,27 +209,3 @@ bool sptm_adjust_mapping_ref(u64 pte, u64 descriptor_mask, int delta)
     spin_unlock(&sptm.frame_lock);
     return true;
 }
-
-void hv_sptm_configure_frames(u64 frame_table_pa)
-{
-    u64 managed_pages = (sptm.managed_end - sptm.managed_start) >> SPTM_PAGE_SHIFT;
-    if (!sptm.enabled) {
-        printf("HV: refusing invalid SPTM frame-table configuration\n");
-        return;
-    }
-
-    size_t frame_table_size = managed_pages * 16;
-    size_t external_ref_table_size = managed_pages * 2 * sizeof(u32);
-    size_t combined_size = frame_table_size + external_ref_table_size;
-    if (!sptm_valid_pa(frame_table_pa, combined_size)) {
-        printf("HV: refusing invalid SPTM frame/reference tables "
-               "0x%lx+0x%lx\n",
-               frame_table_pa, combined_size);
-        return;
-    }
-
-    sptm.frame_table_pa = frame_table_pa;
-    sptm.external_ref_table_pa = frame_table_pa + frame_table_size;
-    memset((void *)sptm.external_ref_table_pa, 0, external_ref_table_size);
-    sysop("dsb ishst");
-}

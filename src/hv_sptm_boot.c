@@ -111,11 +111,9 @@ struct sptm_boot_context {
     u64 bootstrap_pa;
     u64 panic_state_pa;
     u64 scratch_pa;
-    u64 cpu_map_pa;
     u64 frame_table_pa;
     u64 uat_global_state_pa;
     u64 uat_global_root_pa;
-    u64 uat_gpu_region_pa;
     u64 uat_l2_pa;
     u64 uat_l2_va;
     u64 txm_info_va;
@@ -128,7 +126,6 @@ static struct {
     u64 entry;
     u64 bootargs_va;
     u64 bootstrap_va;
-    u64 panic_state_pa;
     struct sptm_boot_pt_page pages[SPTM_BOOT_MAX_TABLES];
     u32 page_count;
 } sptm_boot;
@@ -353,9 +350,12 @@ static void sptm_boot_sort_io_filters(struct sptm_boot_io_filter *filters, u32 c
     }
 }
 
-u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text)
+u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text)
 {
     memset(&sptm_boot, 0, sizeof(sptm_boot));
+    memset(&sptm, 0, sizeof(sptm));
+    spin_init(&sptm.service_lock);
+    spin_init(&sptm.frame_lock);
     void *firmware_adt = adt;
     adt = (void *)guest_adt;
 
@@ -383,6 +383,7 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
     int cpu = cpus;
     ADT_FOREACH_CHILD(adt, cpu)
     cpu_count = max(cpu_count, (u32)sptm_adt_integer(cpu, "cpu-id", 0) + 1);
+    assert(cpu_count <= MAX_CPUS);
 
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
     int defaults = adt_path_offset(adt, "/defaults");
@@ -397,7 +398,6 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
         sptm_boot_property(uat_nodes, ARRAY_SIZE(uat_nodes), "uat-mapping-limit", 256);
     bool uat_tlbi_at_retype = sptm_boot_bool_property(uat_nodes, ARRAY_SIZE(uat_nodes),
                                                       "issue-gmmu-tlbis-at-retype", false);
-    context.uat_gpu_region_pa = sptm_adt_integer(sgx, "gpu-region-base", 0);
 
     size_t managed_pages = (context.managed_end - context.managed_start) / SPTM_PAGE_SIZE;
     size_t frame_table_size = managed_pages * SPTM_FRAME_ENTRY_SIZE;
@@ -418,7 +418,6 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
         (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
     context.scratch_pa =
         (u64)sptm_alloc_zero(&context.allocator, cpu_count * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    context.cpu_map_pa = (u64)sptm_alloc_zero(&context.allocator, (cpu_count + 1) * sizeof(u32), 4);
     u64 txm_stack_array_pa = (u64)sptm_alloc_zero(&context.allocator, cpu_count * sizeof(u64), 8);
     u64 txm_stacks_pa =
         (u64)sptm_alloc_zero(&context.allocator, cpu_count * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
@@ -559,13 +558,9 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
     write64(debug_header_pa + 0x18, xnu_text);
     write64(debug_header_pa + 0x20, xnu_text);
 
-    write32(context.cpu_map_pa, cpu_count);
     cpu = cpus;
     ADT_FOREACH_CHILD(adt, cpu)
-    {
-        u32 logical = sptm_adt_integer(cpu, "cpu-id", 0);
-        write32(context.cpu_map_pa + (logical + 1) * sizeof(u32), sptm_adt_integer(cpu, "reg", 0));
-    }
+    sptm.hv_phys_ids[sptm_adt_integer(cpu, "cpu-id", 0)] = sptm_adt_integer(cpu, "reg", 0);
     for (u32 index = 0; index < cpu_count; index++)
         write64(txm_stack_array_pa + index * sizeof(u64),
                 sptm_boot_va(&context, txm_stacks_pa + index * SPTM_PAGE_SIZE));
@@ -649,26 +644,41 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
     msr(VBAR_EL12, 0);
     msr(SCTLR_EL12, SPTM_SCTLR_BOOT);
 
-    hv_sptm_configure(context.managed_start, context.managed_end, context.physmap_base,
-                      context.scratch_pa, context.ttbr1_pa, context.cpu_map_pa);
-    hv_sptm_configure_frames(context.frame_table_pa);
-    hv_sptm_configure_panic(context.panic_state_pa);
-    u64 uat_info = uat_mode | (u64)uat_va_width << 8 | (u64)uat_segment_limit << 16 |
-                   (u64)uat_mapping_limit << 32 | (u64)uat_tlbi_at_retype << 48;
-    hv_sptm_configure_uat(context.uat_l2_pa, uat_l2_size, uat_info, context.uat_global_state_pa,
-                          context.uat_gpu_region_pa, context.uat_l2_va);
-    hv_sptm_configure_uat_handoff(sptm_adt_integer(sgx, "gfx-handoff-base", 0),
-                                  sptm_adt_integer(sgx, "gfx-handoff-size", 0));
-    hv_sptm_configure_txm(context.txm_info_va);
+    sptm.managed_start = context.managed_start;
+    sptm.managed_end = context.managed_end;
+    sptm.physmap_base = context.physmap_base;
+    sptm.physmap_end = context.physmap_end;
+    sptm.scratch_pa = context.scratch_pa;
+    sptm.kernel_root = context.ttbr1_pa;
+    sptm.max_cpus = cpu_count;
+    sptm.frame_table_pa = context.frame_table_pa;
+    sptm.external_ref_table_pa = context.frame_table_pa + frame_table_size;
+    sptm.panic_state_pa = context.panic_state_pa;
+    sptm.txm_info_va = context.txm_info_va;
+    sptm.sprr_perm[0] = 0x2010002030100000;
+    sptm.sprr_perm[1] = 0x2020a506f020f0e0;
+    sptm.enabled = true;
+
+    sptm.uat_global_state = context.uat_global_state_pa;
+    sptm.uat_gpu_contexts = sptm_adt_integer(sgx, "gpu-region-base", 0);
+    sptm.uat_shared_l2_pa = context.uat_l2_pa;
+    sptm.uat_shared_l2_va = context.uat_l2_va;
+    sptm.uat_segment_limit = uat_segment_limit;
+    sptm.uat_mapping_limit = uat_mapping_limit;
+    sptm.uat_va_width = uat_va_width;
+    sptm.uat_mode = uat_mode;
+    sptm.uat_tlbi_at_retype = uat_tlbi_at_retype;
+    sptm_uat_configure(context.uat_global_root_pa, uat_l2_size,
+                       sptm_adt_integer(sgx, "gfx-handoff-base", 0),
+                       sptm_adt_integer(sgx, "gfx-handoff-size", 0));
     sptm_init_platform(&context.allocator);
 
     sptm_boot.entry = context.kernel_entry;
     sptm_boot.bootargs_va = sptm_boot_va(&context, bootargs_pa);
     sptm_boot.bootstrap_va = sptm_boot_va(&context, context.bootstrap_pa);
-    sptm_boot.panic_state_pa = context.panic_state_pa;
     sptm_boot.ready = true;
     adt = firmware_adt;
-    return sptm_boot.panic_state_pa;
+    return context.panic_state_pa;
 }
 
 void sptm_boot_prepare_start(void **entry, u64 regs[4], bool secondary)

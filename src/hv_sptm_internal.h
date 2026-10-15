@@ -45,7 +45,6 @@
 #define SPTM_SART_PAGE_SHIFT 12
 #define SPTM_SART_PAGE_SIZE  BIT(SPTM_SART_PAGE_SHIFT)
 
-#define SPTM_NVME_CONFIG_WORDS      17
 #define SPTM_NVME_TCB_SIZE          0x80
 #define SPTM_NVME_TCB_ALIGNMENT     0x1000
 #define SPTM_NVME_PRP_PAGE_SHIFT    12
@@ -54,10 +53,6 @@
 #define SPTM_NVME_PRP_SLOT_SIZE     0x800
 #define SPTM_NVME_MAX_PRPS          0x101
 #define SPTM_NVME_COMMAND_SIZE      32
-#define SPTM_NVME_FLAG_PRP_FLUSH_WA BIT(0)
-#define SPTM_NVME_FLAG_TL_WA        BIT(1)
-#define SPTM_NVME_FLAG_VDMA_WA      BIT(2)
-#define SPTM_NVME_FLAG_SHA_PRESENT  BIT(3)
 
 #define NVMMU_QUEUE_COUNT    0x100
 #define NVMMU_ADMIN_TCB_BASE 0x108
@@ -400,7 +395,6 @@ struct sptm_state {
     u64 uat_global_state;
     u64 uat_gpu_contexts;
     u64 uat_shared_l2_pa;
-    size_t uat_shared_l2_size;
     u64 uat_shared_l2_va;
     u64 uat_handoff_pa;
     bool uat_handoff_pending[UAT_HANDOFF_SLOT_COUNT];
@@ -419,7 +413,6 @@ struct sptm_state {
     u16 sart_guarded_mask;
     u16 sart_guard_count;
     bool sart_exclusive_bounds;
-    bool sart_configured;
     spinlock_t service_lock;
     spinlock_t frame_lock;
     struct sptm_cpu cpus[MAX_CPUS];
@@ -460,7 +453,6 @@ struct sptm_dart *sptm_find_dart(u32 id);
 bool sptm_dart_flush_all(struct sptm_dart *dart);
 struct sptm_dart_sid *sptm_dart_sid(const struct sptm_dart *dart, u32 sid);
 bool sptm_dart_valid_table(const struct sptm_dart_sid *state, u64 pa, size_t size);
-u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text);
 bool sptm_dart_power(struct exc_info *ctx, bool power_up);
 bool sptm_dart_init(struct exc_info *ctx);
 bool sptm_dart_error_endpoint(struct exc_info *ctx);
@@ -481,6 +473,7 @@ bool sptm_adjust_parent_links(u64 child, int delta);
 bool sptm_adjust_mapping_ref(u64 pte, u64 descriptor_mask, int delta);
 
 /* UAT */
+void sptm_uat_configure(u64 global_root_pa, u64 shared_l2_size, u64 handoff_pa, u64 handoff_size);
 void sptm_uat_tlbi_all(void);
 bool sptm_handle_uat(struct exc_info *ctx, u32 endpoint);
 
