@@ -17,8 +17,6 @@ void hv_sptm_configure_uat_handoff(u64 handoff_pa, u64 handoff_size);
 void hv_sptm_configure_txm(u64 info_va);
 void hv_sptm_configure_sart(u64 base, u64 canary, u64 info);
 void hv_sptm_configure_nvme(u64 config);
-void hv_sptm_configure_dart(u64 info, u64 config, u64 instance0, u64 instance1, u64 instance2,
-                            u64 instance3);
 bool hv_sptm_handle_hvc(struct exc_info *ctx, u32 immediate);
 void sptm_boot_prepare_start(void **entry, u64 regs[4], bool secondary);
 bool hv_handle_clpc_hvc(struct exc_info *ctx, u32 immediate);

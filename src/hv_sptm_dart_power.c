@@ -37,11 +37,6 @@ static bool sptm_dart_clear_errors(const struct sptm_dart *dart)
     return true;
 }
 
-u64 sptm_dart_clock_address(u64 entry)
-{
-    return entry & ~(u64)SPTM_DART_CLOCK_FLAGS;
-}
-
 static struct sptm_dart_clock_ref *sptm_dart_clock_ref(u64 address, bool create)
 {
     struct sptm_dart_clock_ref *empty = NULL;
@@ -100,10 +95,6 @@ static void sptm_dart_shared_clock_release(u64 address)
 static bool sptm_dart_powerup_sidebands(struct sptm_dart *dart)
 {
     if (dart->clock_count) {
-        u64 clocks_pa = sptm_pointer_pa(dart->clock_entries, dart->clock_count * sizeof(u64));
-        if (!clocks_pa)
-            return false;
-
         if (dart->flags & SPTM_DART_UNGANG_SHARED_PS) {
             // apcie0 and apcie2 share this FPAG slice on T8132.
             if (dart->clock_active)
@@ -111,16 +102,12 @@ static bool sptm_dart_powerup_sidebands(struct sptm_dart *dart)
 
             size_t acquired = 0;
             for (; acquired < dart->clock_count; acquired++) {
-                u64 address = sptm_dart_clock_address(read64(clocks_pa + acquired * sizeof(u64)));
-                if (!sptm_dart_shared_clock_acquire(address))
+                if (!sptm_dart_shared_clock_acquire(dart->clock_entries[acquired]))
                     break;
             }
             if (acquired != dart->clock_count) {
-                while (acquired) {
-                    u64 address =
-                        sptm_dart_clock_address(read64(clocks_pa + --acquired * sizeof(u64)));
-                    sptm_dart_shared_clock_release(address);
-                }
+                while (acquired)
+                    sptm_dart_shared_clock_release(dart->clock_entries[--acquired]);
                 return false;
             }
             dart->clock_active = true;
@@ -129,7 +116,7 @@ static bool sptm_dart_powerup_sidebands(struct sptm_dart *dart)
         }
 
         for (size_t index = 0; index < dart->clock_count; index++) {
-            u64 address = sptm_dart_clock_address(read64(clocks_pa + index * sizeof(u64)));
+            u64 address = dart->clock_entries[index];
             u32 value = read32(address);
             if (value == DART_UNAVAILABLE || value == UINT32_MAX)
                 return false;
@@ -144,14 +131,8 @@ static bool sptm_dart_apply_tunables(const struct sptm_dart *dart)
 {
     if (!dart->tunable_count)
         return true;
-    u64 entries_pa = sptm_pointer_pa(dart->tunable_entries,
-                                     dart->tunable_count * sizeof(struct sptm_dart_tunable));
-    if (!entries_pa)
-        return false;
-    struct sptm_dart_tunable *entries = (void *)entries_pa;
-
     for (size_t index = 0; index < dart->tunable_count; index++) {
-        struct sptm_dart_tunable *entry = &entries[index];
+        const struct sptm_dart_tunable *entry = &dart->tunable_entries[index];
         bool known_base = false;
         for (size_t instance = 0; instance < dart->instance_count; instance++)
             known_base |= entry->base == dart->instances[instance];
@@ -206,13 +187,8 @@ static bool sptm_dart_program_dapf(const struct sptm_dart *dart)
 {
     if (!dart->dapf_count)
         return true;
-    u64 entries_pa =
-        sptm_pointer_pa(dart->dapf_entries, dart->dapf_count * sizeof(struct sptm_dart_dapf));
-    if (!entries_pa)
-        return false;
-    struct sptm_dart_dapf *entries = (void *)entries_pa;
     for (size_t index = 0; index < dart->dapf_count; index++) {
-        struct sptm_dart_dapf *entry = &entries[index];
+        const struct sptm_dart_dapf *entry = &dart->dapf_entries[index];
         write32(entry->base + 0x04, entry->r4);
         write64(entry->base + 0x08, entry->start);
         write64(entry->base + 0x10, entry->end);
@@ -225,26 +201,21 @@ static bool sptm_dart_program_dapf(const struct sptm_dart *dart)
 
 static void sptm_dart_powerdown_sidebands(struct sptm_dart *dart)
 {
-    u64 clocks_pa = sptm_pointer_pa(dart->clock_entries, dart->clock_count * sizeof(u64));
-    if (clocks_pa) {
-        if (dart->flags & SPTM_DART_UNGANG_SHARED_PS) {
-            if (!dart->clock_active)
-                return;
-            for (size_t index = 0; index < dart->clock_count; index++) {
-                u64 address = sptm_dart_clock_address(read64(clocks_pa + index * sizeof(u64)));
-                sptm_dart_shared_clock_release(address);
-            }
-            dart->clock_active = false;
-            sysop("dsb sy");
+    if (dart->flags & SPTM_DART_UNGANG_SHARED_PS) {
+        if (!dart->clock_active)
             return;
-        }
+        for (size_t index = 0; index < dart->clock_count; index++)
+            sptm_dart_shared_clock_release(dart->clock_entries[index]);
+        dart->clock_active = false;
+        sysop("dsb sy");
+        return;
+    }
 
-        for (size_t index = 0; index < dart->clock_count; index++) {
-            u64 address = sptm_dart_clock_address(read64(clocks_pa + index * sizeof(u64)));
-            u32 value = read32(address);
-            if (value != DART_UNAVAILABLE && value != UINT32_MAX)
-                write32(address, value & ~FPAG_CLOCK_PROTECTION);
-        }
+    for (size_t index = 0; index < dart->clock_count; index++) {
+        u64 address = dart->clock_entries[index];
+        u32 value = read32(address);
+        if (value != DART_UNAVAILABLE && value != UINT32_MAX)
+            write32(address, value & ~FPAG_CLOCK_PROTECTION);
     }
     sysop("dsb sy");
 }

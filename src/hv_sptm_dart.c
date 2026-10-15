@@ -92,7 +92,7 @@ struct sptm_dart_sid *sptm_dart_sid(const struct sptm_dart *dart, u32 sid)
 {
     if (!dart->sid_states || sid >= dart->sid_count)
         return NULL;
-    return (struct sptm_dart_sid *)(dart->sid_states + sid * sizeof(struct sptm_dart_sid));
+    return &dart->sid_states[sid];
 }
 
 bool sptm_dart_valid_table(const struct sptm_dart_sid *state, u64 pa, size_t size)
@@ -653,41 +653,18 @@ bool sptm_handle_dart(struct exc_info *ctx, u32 endpoint)
     return handled;
 }
 
-void hv_sptm_configure_dart(u64 info, u64 config, u64 instance0, u64 instance1, u64 instance2,
-                            u64 instance3)
+void sptm_dart_configure(const struct sptm_dart_config *config)
 {
-    u32 id = info;
-    u32 sid_count = (info >> 32) & 0xffff;
-    u32 instance_count = (info >> 48) & 0xff;
-    u64 instances[] = {instance0, instance1, instance2, instance3};
-    u64 config_pa = sptm_pointer_pa(config, sizeof(struct sptm_dart_config));
-    struct sptm_dart_config dart_config;
-    if (config_pa)
-        memcpy(&dart_config, (void *)config_pa, sizeof(dart_config));
-    else
-        memset(&dart_config, 0, sizeof(dart_config));
-
-    if (!sptm.enabled || !sid_count || sid_count > SPTM_MAX_DART_SIDS || !config_pa ||
-        !sptm_pointer_pa(dart_config.sid_states, sid_count * sizeof(struct sptm_dart_sid)) ||
-        dart_config.dapf_count > SPTM_MAX_DART_DAPF ||
-        dart_config.clock_count > SPTM_MAX_DART_CLOCKS ||
-        dart_config.tunable_count > SPTM_MAX_DART_TUNABLES ||
-        (dart_config.dapf_count &&
-         !sptm_pointer_pa(dart_config.dapf_entries,
-                          dart_config.dapf_count * sizeof(struct sptm_dart_dapf))) ||
-        (dart_config.clock_count &&
-         !sptm_pointer_pa(dart_config.clock_entries, dart_config.clock_count * sizeof(u64))) ||
-        (dart_config.tunable_count &&
-         !sptm_pointer_pa(dart_config.tunable_entries,
-                          dart_config.tunable_count * sizeof(struct sptm_dart_tunable))) ||
-        !instance_count || instance_count > SPTM_MAX_DART_INSTANCES) {
-        printf("HV: refusing invalid SPTM DART configuration 0x%lx\n", info);
+    u32 id = config->id;
+    if (!sptm.enabled || !config->sid_count || config->sid_count > SPTM_MAX_DART_SIDS) {
+        printf("HV: refusing invalid SPTM DART %u configuration\n", id);
         return;
     }
 
-    for (size_t index = 0; index < instance_count; index++) {
-        if (!instances[index] || (instances[index] & 3)) {
-            printf("HV: refusing invalid SPTM DART %u instance 0x%lx\n", id, instances[index]);
+    for (size_t index = 0; index < config->instance_count; index++) {
+        if (!config->instances[index] || (config->instances[index] & 3)) {
+            printf("HV: refusing invalid SPTM DART %u instance 0x%lx\n", id,
+                   config->instances[index]);
             return;
         }
     }
@@ -703,36 +680,17 @@ void hv_sptm_configure_dart(u64 info, u64 config, u64 instance0, u64 instance1, 
 
     memset(dart, 0, sizeof(*dart));
     dart->id = id;
-    dart->sid_count = sid_count;
-    dart->instance_count = instance_count;
-    dart->sid_states =
-        sptm_pointer_pa(dart_config.sid_states, sid_count * sizeof(struct sptm_dart_sid));
-    dart->dapf_entries = dart_config.dapf_entries;
-    dart->clock_entries = dart_config.clock_entries;
-    dart->tunable_entries = dart_config.tunable_entries;
-    dart->dapf_count = dart_config.dapf_count;
-    dart->clock_count = dart_config.clock_count;
-    dart->tunable_count = dart_config.tunable_count;
-    dart->flags = dart_config.flags;
-    if (dart->flags & ~(SPTM_DART_FLUSH_BY_DVA | SPTM_DART_AVOID_MAP_TLBI | SPTM_DART_RELAXED_RW |
-                        SPTM_DART_RETENTION | SPTM_DART_ALLOW_PTE_REMAP | SPTM_DART_CLAMP_TLIMITS |
-                        SPTM_DART_IGNORE_SECONDARY | SPTM_DART_UNGANG_SHARED_PS)) {
-        printf("HV: refusing invalid SPTM DART %u flags 0x%x\n", id, dart->flags);
-        memset(dart, 0, sizeof(*dart));
-        return;
-    }
-    if (dart->clock_count) {
-        u64 clocks_pa = sptm_pointer_pa(dart->clock_entries, dart->clock_count * sizeof(u64));
-        for (size_t index = 0; index < dart->clock_count; index++) {
-            u64 entry = read64(clocks_pa + index * sizeof(u64));
-            if (entry & SPTM_DART_CLOCK_FLAGS || !sptm_dart_clock_address(entry)) {
-                printf("HV: refusing inconsistent SPTM DART %u clock state\n", id);
-                memset(dart, 0, sizeof(*dart));
-                return;
-            }
-        }
-    }
-    for (u32 sid = 0; sid < sid_count; sid++) {
+    dart->sid_count = config->sid_count;
+    dart->instance_count = config->instance_count;
+    dart->sid_states = config->sid_states;
+    dart->dapf_entries = config->dapf_entries;
+    dart->clock_entries = config->clock_entries;
+    dart->tunable_entries = config->tunable_entries;
+    dart->dapf_count = config->dapf_count;
+    dart->clock_count = config->clock_count;
+    dart->tunable_count = config->tunable_count;
+    dart->flags = config->flags;
+    for (u32 sid = 0; sid < dart->sid_count; sid++) {
         struct sptm_dart_sid *state = sptm_dart_sid(dart, sid);
         if (state && (state->pt_start || state->pt_end)) {
             u64 size = state->pt_end - state->pt_start;
@@ -760,8 +718,8 @@ void hv_sptm_configure_dart(u64 info, u64 config, u64 instance0, u64 instance1, 
         if (state && (state->flags & SPTM_DART_SID_ENABLED))
             dart->boot_streams[sid / 32] |= BIT(sid % 32);
     }
-    for (size_t index = 0; index < instance_count; index++)
+    for (size_t index = 0; index < dart->instance_count; index++)
         memcpy(dart->active_streams[index], dart->boot_streams, sizeof(dart->boot_streams));
     dart->valid = true;
-    memcpy(dart->instances, instances, instance_count * sizeof(u64));
+    memcpy(dart->instances, config->instances, sizeof(dart->instances));
 }

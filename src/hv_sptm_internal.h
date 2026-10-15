@@ -99,8 +99,6 @@
 
 #define FPAG_CLOCK_PROTECTION BIT(4)
 
-#define SPTM_DART_CLOCK_FLAGS 3
-
 #define DART_PTE_VALID       BIT(0)
 #define DART_PTE_UNCACHABLE  BIT(1)
 #define DART_PTE_WRPROT      BIT(2)
@@ -234,10 +232,10 @@ struct sptm_dart {
     u16 sid_words;
     u8 instance_count;
     bool valid;
-    u64 sid_states;
-    u64 dapf_entries;
-    u64 clock_entries;
-    u64 tunable_entries;
+    struct sptm_dart_sid *sid_states;
+    const struct sptm_dart_dapf *dapf_entries;
+    const u64 *clock_entries;
+    const struct sptm_dart_tunable *tunable_entries;
     u16 dapf_count;
     u8 clock_count;
     u16 tunable_count;
@@ -270,18 +268,21 @@ struct sptm_dart_sid {
     u32 tcr;
     u8 root_level;
     u8 flags;
-    u16 reserved;
 };
 
 struct sptm_dart_config {
-    u64 sid_states;
-    u64 dapf_entries;
-    u64 clock_entries;
-    u64 tunable_entries;
+    u32 id;
+    u32 sid_count;
+    u32 instance_count;
+    u32 flags;
+    u64 instances[SPTM_MAX_DART_INSTANCES];
+    struct sptm_dart_sid *sid_states;
+    const struct sptm_dart_dapf *dapf_entries;
+    const u64 *clock_entries;
+    const struct sptm_dart_tunable *tunable_entries;
     u32 dapf_count;
     u32 clock_count;
     u32 tunable_count;
-    u32 flags;
 };
 
 struct sptm_dart_dapf {
@@ -291,7 +292,6 @@ struct sptm_dart_dapf {
     u32 r4;
     u32 control;
     u32 r20;
-    u32 reserved;
 };
 
 struct sptm_dart_tunable {
@@ -317,11 +317,6 @@ struct sptm_uat_segment {
 static_assert(sizeof(struct sptm_uat_segment) == 16, "unexpected UAT segment size");
 
 #define SPTM_UAT_BATCH_PAGES 256
-
-static_assert(sizeof(struct sptm_dart_sid) == 48, "unexpected DART SID-state size");
-static_assert(sizeof(struct sptm_dart_config) == 48, "unexpected DART configuration size");
-static_assert(sizeof(struct sptm_dart_dapf) == 40, "unexpected DART DAPF-entry size");
-static_assert(sizeof(struct sptm_dart_tunable) == 32, "unexpected DART tunable-entry size");
 
 struct sptm_surt_root {
     u64 root;
@@ -458,8 +453,8 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
 bool sptm_dart_power(struct exc_info *ctx, bool power_up);
 bool sptm_dart_init(struct exc_info *ctx);
 bool sptm_dart_error_endpoint(struct exc_info *ctx);
-u64 sptm_dart_clock_address(u64 entry);
 bool sptm_handle_dart(struct exc_info *ctx, u32 endpoint);
+void sptm_dart_configure(const struct sptm_dart_config *config);
 
 /* Frame ownership */
 bool sptm_is_table_type(u8 type);

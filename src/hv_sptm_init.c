@@ -311,23 +311,24 @@ static void sptm_init_darts(struct sptm_init_allocator *allocator)
         struct sptm_dart_tunable *tunables =
             sptm_init_alloc(allocator, SPTM_MAX_DART_TUNABLES * sizeof(*tunables), 16);
         u64 *clocks = sptm_init_alloc(allocator, SPTM_MAX_DART_CLOCKS * sizeof(*clocks), 16);
-        struct sptm_dart_config *config = sptm_init_alloc_zero(allocator, sizeof(*config), 16);
         const char *name = adt_get_name(adt, node);
 
         sptm_dart_sid_states(node, name, states, sid_count);
-        config->sid_states = (u64)states;
-        config->dapf_entries = (u64)dapf;
-        config->clock_entries = (u64)clocks;
-        config->tunable_entries = (u64)tunables;
-        config->dapf_count = sptm_dart_dapf(node, &fpad, dapf);
-        config->clock_count = sptm_dart_clocks(node, &trad, &fpag, clocks);
-        config->tunable_count = sptm_dart_tunables(node, &trad, tunables);
-        config->flags = sptm_dart_flags(node, name);
-
-        u64 info =
-            sptm_adt_integer(node, "dart-id", 0) | (u64)sid_count << 32 | (u64)trad.count << 48;
-        hv_sptm_configure_dart(info, (u64)config, trad.base[0], trad.base[1], trad.base[2],
-                               trad.base[3]);
+        struct sptm_dart_config config = {
+            .id = sptm_adt_integer(node, "dart-id", 0),
+            .sid_count = sid_count,
+            .instance_count = trad.count,
+            .flags = sptm_dart_flags(node, name),
+            .sid_states = states,
+            .dapf_entries = dapf,
+            .clock_entries = clocks,
+            .tunable_entries = tunables,
+            .dapf_count = sptm_dart_dapf(node, &fpad, dapf),
+            .clock_count = sptm_dart_clocks(node, &trad, &fpag, clocks),
+            .tunable_count = sptm_dart_tunables(node, &trad, tunables),
+        };
+        memcpy(config.instances, trad.base, sizeof(config.instances));
+        sptm_dart_configure(&config);
     }
 }
 
