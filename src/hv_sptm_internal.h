@@ -181,6 +181,7 @@
 #define SPTM_DART_IGNORE_SECONDARY BIT(6)
 #define SPTM_DART_UNGANG_SHARED_PS BIT(7)
 
+#define SPTM_FRAME_KERNEL_CODE             6
 #define SPTM_FRAME_KERNEL_ROOT             8
 #define SPTM_FRAME_PAGE_TABLE              9
 #define SPTM_FRAME_USER_ROOT               18
@@ -194,6 +195,7 @@
 #define SPTM_FRAME_KERNEL_RESTRICTED       35
 #define SPTM_FRAME_SUBPAGE                 40
 #define SPTM_FRAME_DEFAULT                 11
+#define SPTM_FRAME_RO                      12
 #define SPTM_FRAME_XNU_IOMMU               24
 #define SPTM_FRAME_XNU_IO                  26
 #define SPTM_FRAME_PROTECTED_IO            27
@@ -211,6 +213,11 @@
 #define SPTM_COMMPAGE_CPU_CAPS32_OFFSET    0x20
 /* Either bit selects AMX in the guest vDSP capability dispatcher. */
 #define SPTM_CPU_CAP_AMX_MASK              (3ULL << 28)
+
+struct sptm_allocator {
+    u64 next;
+    u64 end;
+};
 
 struct sptm_cpu {
     u32 phys_id;
@@ -433,6 +440,12 @@ struct sptm_state {
 
 extern struct sptm_state sptm;
 
+/* Boot */
+void *sptm_alloc(struct sptm_allocator *allocator, size_t size, size_t alignment);
+void *sptm_alloc_zero(struct sptm_allocator *allocator, size_t size, size_t alignment);
+u64 sptm_adt_integer(int node, const char *name, u64 fallback);
+void sptm_init_platform(struct sptm_allocator *allocator);
+
 /* Core */
 bool sptm_valid_pa(u64 pa, size_t size);
 bool sptm_valid_platform_pa(u64 pa, size_t size);
@@ -447,7 +460,6 @@ struct sptm_dart *sptm_find_dart(u32 id);
 bool sptm_dart_flush_all(struct sptm_dart *dart);
 struct sptm_dart_sid *sptm_dart_sid(const struct sptm_dart *dart, u32 sid);
 bool sptm_dart_valid_table(const struct sptm_dart_sid *state, u64 pa, size_t size);
-void sptm_init_platform(u64 guest_adt, u64 aux_start, u64 aux_end);
 u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text);
 bool sptm_dart_power(struct exc_info *ctx, bool power_up);
 bool sptm_dart_init(struct exc_info *ctx);

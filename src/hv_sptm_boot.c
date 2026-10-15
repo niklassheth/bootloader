@@ -23,22 +23,6 @@
 #define SPTM_LEAF_DATA_NC    0x60000000000407ULL
 #define SPTM_TABLE_DESC      3
 
-#define SPTM_FRAME_KERNEL_CODE  6
-#define SPTM_FRAME_KERNEL_ROOT  8
-#define SPTM_FRAME_PAGE_TABLE   9
-#define SPTM_FRAME_DEFAULT      11
-#define SPTM_FRAME_RO           12
-#define SPTM_FRAME_USER_ROOT    18
-#define SPTM_FRAME_SHARED_ROOT  19
-#define SPTM_FRAME_XNU_ROOT     20
-#define SPTM_FRAME_SHARED_PT    21
-#define SPTM_FRAME_ROZONE_PT    22
-#define SPTM_FRAME_COMMPAGE_PT  23
-#define SPTM_FRAME_XNU_IOMMU    24
-#define SPTM_FRAME_STAGE2_ROOT  33
-#define SPTM_FRAME_STAGE2_PT    34
-#define SPTM_FRAME_SUBPAGE_ROOT 40
-
 #define MACHO_MAGIC_64      0xfeedfacf
 #define MACHO_LC_SEGMENT_64 0x19
 #define MACHO_LC_UNIXTHREAD 0x05
@@ -87,11 +71,6 @@ struct macho_thread_64 {
     u32 flags;
 } PACKED;
 
-struct sptm_boot_allocator {
-    u64 next;
-    u64 end;
-};
-
 struct sptm_boot_pt_page {
     u64 pa;
     u8 level;
@@ -118,7 +97,7 @@ struct sptm_boot_papt {
 } PACKED;
 
 struct sptm_boot_context {
-    struct sptm_boot_allocator allocator;
+    struct sptm_allocator allocator;
     u64 managed_start;
     u64 managed_end;
     u64 physmap_base;
@@ -154,7 +133,7 @@ static struct {
     u32 page_count;
 } sptm_boot;
 
-static void *sptm_boot_alloc(struct sptm_boot_allocator *allocator, size_t size, size_t alignment)
+void *sptm_alloc(struct sptm_allocator *allocator, size_t size, size_t alignment)
 {
     u64 address = ALIGN_UP(allocator->next, alignment);
     assert(address + size <= allocator->end);
@@ -162,15 +141,14 @@ static void *sptm_boot_alloc(struct sptm_boot_allocator *allocator, size_t size,
     return (void *)address;
 }
 
-static void *sptm_boot_alloc_zero(struct sptm_boot_allocator *allocator, size_t size,
-                                  size_t alignment)
+void *sptm_alloc_zero(struct sptm_allocator *allocator, size_t size, size_t alignment)
 {
-    void *result = sptm_boot_alloc(allocator, size, alignment);
+    void *result = sptm_alloc(allocator, size, alignment);
     memset(result, 0, size);
     return result;
 }
 
-static u64 sptm_boot_adt_integer(int node, const char *name, u64 fallback)
+u64 sptm_adt_integer(int node, const char *name, u64 fallback)
 {
     u32 size;
     const void *value = adt_getprop(adt, node, name, &size);
@@ -196,7 +174,9 @@ static bool sptm_boot_adt_bool(int node, const char *name, bool fallback)
 
 static void sptm_boot_adt_region(int node, const char *name, u64 *address, u64 *size)
 {
-    const u64 *region = adt_getprop(adt, node, name, NULL);
+    u64 region[2];
+    if (ADT_GETPROP_ARRAY(adt, node, name, region) < 0)
+        panic("SPTM: memory map has no %s region\n", name);
     *address = region[0];
     *size = region[1];
 }
@@ -205,7 +185,7 @@ static u64 sptm_boot_property(const int *nodes, size_t count, const char *name, 
 {
     for (size_t index = 0; index < count; index++) {
         if (adt_get_property(adt, nodes[index], name))
-            return sptm_boot_adt_integer(nodes[index], name, fallback);
+            return sptm_adt_integer(nodes[index], name, fallback);
     }
     return fallback;
 }
@@ -226,7 +206,7 @@ static u64 sptm_boot_va(const struct sptm_boot_context *context, u64 pa)
 
 static u64 sptm_boot_alloc_table(struct sptm_boot_context *context, u8 level)
 {
-    u64 pa = (u64)sptm_boot_alloc_zero(&context->allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+    u64 pa = (u64)sptm_alloc_zero(&context->allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
     assert(sptm_boot.page_count < ARRAY_SIZE(sptm_boot.pages));
     sptm_boot.pages[sptm_boot.page_count++] = (struct sptm_boot_pt_page){pa, level};
     return pa;
@@ -258,13 +238,6 @@ static void sptm_boot_map_range(struct sptm_boot_context *context, u64 root, u64
         sptm_boot_map_page(context, root, va + offset, pa + offset, attributes);
 }
 
-static void sptm_boot_retype_page(struct sptm_boot_context *context, u64 root, u64 va, u64 pa,
-                                  u64 attributes)
-{
-    u64 table = sptm_boot_ensure_l3(context, root, va);
-    ((u64 *)table)[(va >> SPTM_PAGE_SHIFT) & 0x7ff] = (pa & SPTM_DESC_PA_MASK_16K) | attributes;
-}
-
 static void sptm_boot_preallocate_l3(struct sptm_boot_context *context, u64 root, u64 start,
                                      u64 end)
 {
@@ -280,35 +253,13 @@ static u16 sptm_boot_valid_count(u64 table)
     return count;
 }
 
-static bool sptm_boot_table_frame(u8 type)
-{
-    switch (type) {
-        case SPTM_FRAME_KERNEL_ROOT:
-        case SPTM_FRAME_PAGE_TABLE:
-        case SPTM_FRAME_USER_ROOT:
-        case SPTM_FRAME_SHARED_ROOT:
-        case SPTM_FRAME_XNU_ROOT:
-        case SPTM_FRAME_SHARED_PT:
-        case SPTM_FRAME_ROZONE_PT:
-        case SPTM_FRAME_COMMPAGE_PT:
-        case SPTM_FRAME_STAGE2_ROOT:
-        case SPTM_FRAME_STAGE2_PT:
-        case SPTM_FRAME_SUBPAGE_ROOT:
-            return true;
-        default:
-            return false;
-    }
-}
-
 static void sptm_boot_set_frame(struct sptm_boot_context *context, u64 pa, u8 type, u32 ro, u32 wx,
                                 u8 level, u16 valid, u16 iommu_refs)
 {
-    if (pa < context->managed_start || pa >= context->managed_end)
-        return;
     u8 *entry = context->frame_table +
                 ((pa - context->managed_start) >> SPTM_PAGE_SHIFT) * SPTM_FRAME_ENTRY_SIZE;
     entry[2] = type;
-    if (sptm_boot_table_frame(type)) {
+    if (sptm_is_table_type(type)) {
         entry[4] = level;
         write16((u64)entry + 8, valid);
     } else if (type == SPTM_FRAME_XNU_IOMMU) {
@@ -421,7 +372,7 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
     context.physmap_end = bootargs->virt_base + bootargs->mem_size;
     u64 aux_start = ALIGN_UP(bootargs->top_of_kernel_data, SPTM_PAGE_SIZE);
     u64 aux_end = aux_start + SPTM_AUX_SIZE;
-    context.allocator = (struct sptm_boot_allocator){aux_start, aux_end};
+    context.allocator = (struct sptm_allocator){aux_start, aux_end};
     // Keep every handoff object below the RAM XNU is allowed to allocate.
     bootargs->top_of_kernel_data = aux_end;
 
@@ -431,7 +382,7 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
     u32 cpu_count = 0;
     int cpu = cpus;
     ADT_FOREACH_CHILD(adt, cpu)
-    cpu_count = max(cpu_count, (u32)sptm_boot_adt_integer(cpu, "cpu-id", 0) + 1);
+    cpu_count = max(cpu_count, (u32)sptm_adt_integer(cpu, "cpu-id", 0) + 1);
 
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
     int defaults = adt_path_offset(adt, "/defaults");
@@ -446,52 +397,48 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
         sptm_boot_property(uat_nodes, ARRAY_SIZE(uat_nodes), "uat-mapping-limit", 256);
     bool uat_tlbi_at_retype = sptm_boot_bool_property(uat_nodes, ARRAY_SIZE(uat_nodes),
                                                       "issue-gmmu-tlbis-at-retype", false);
-    context.uat_gpu_region_pa = sptm_boot_adt_integer(sgx, "gpu-region-base", 0);
+    context.uat_gpu_region_pa = sptm_adt_integer(sgx, "gpu-region-base", 0);
 
     size_t managed_pages = (context.managed_end - context.managed_start) / SPTM_PAGE_SIZE;
     size_t frame_table_size = managed_pages * SPTM_FRAME_ENTRY_SIZE;
     size_t external_ref_table_size = managed_pages * 8;
 
-    context.bootstrap_pa = (u64)sptm_boot_alloc_zero(&context.allocator, SPTM_BOOTSTRAP_SIZE, 16);
-    u64 debug_header_pa = (u64)sptm_boot_alloc_zero(&context.allocator, 0x100, 16);
+    context.bootstrap_pa = (u64)sptm_alloc_zero(&context.allocator, SPTM_BOOTSTRAP_SIZE, 16);
+    u64 debug_header_pa = (u64)sptm_alloc_zero(&context.allocator, 0x100, 16);
     context.panic_state_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    u64 papt_count_pa = (u64)sptm_boot_alloc_zero(&context.allocator, sizeof(u32), 4);
+        (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+    u64 papt_count_pa = (u64)sptm_alloc_zero(&context.allocator, sizeof(u32), 4);
     u64 papt_ranges_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, 3 * sizeof(struct sptm_boot_papt), 8);
-    u64 trace_buffer_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+        (u64)sptm_alloc_zero(&context.allocator, 3 * sizeof(struct sptm_boot_papt), 8);
+    u64 trace_buffer_pa = (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
     u64 dispatch_states_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    u64 saved_states_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+        (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+    u64 saved_states_pa = (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
     u64 event_counters_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+        (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
     context.scratch_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, cpu_count * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    context.cpu_map_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, (cpu_count + 1) * sizeof(u32), 4);
-    u64 txm_stack_array_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, cpu_count * sizeof(u64), 8);
+        (u64)sptm_alloc_zero(&context.allocator, cpu_count * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+    context.cpu_map_pa = (u64)sptm_alloc_zero(&context.allocator, (cpu_count + 1) * sizeof(u32), 4);
+    u64 txm_stack_array_pa = (u64)sptm_alloc_zero(&context.allocator, cpu_count * sizeof(u64), 8);
     u64 txm_stacks_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, cpu_count * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    u64 txm_info_pa = (u64)sptm_boot_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+        (u64)sptm_alloc_zero(&context.allocator, cpu_count * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+    u64 txm_info_pa = (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
     context.txm_info_va = sptm_boot_va(&context, txm_info_pa);
     context.uat_global_state_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+        (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
     context.uat_global_root_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+        (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
     u64 kernel_stacks_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, SPTM_CPU_STACK_WINDOW_SIZE, SPTM_PAGE_SIZE);
+        (u64)sptm_alloc_zero(&context.allocator, SPTM_CPU_STACK_WINDOW_SIZE, SPTM_PAGE_SIZE);
     // Keep EL2-only RO/WX reservations after the ABI-visible frame table.
-    context.frame_table_pa = (u64)sptm_boot_alloc_zero(
+    context.frame_table_pa = (u64)sptm_alloc_zero(
         &context.allocator, frame_table_size + external_ref_table_size, SPTM_PAGE_SIZE);
     context.frame_table = (void *)context.frame_table_pa;
     u64 frame_params_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, 256 * SPTM_FRAME_PARAM_SIZE, SPTM_PAGE_SIZE);
-    u64 pt_attrs_pa = (u64)sptm_boot_alloc_zero(&context.allocator, 6 * sizeof(u64), 8);
+        (u64)sptm_alloc_zero(&context.allocator, 256 * SPTM_FRAME_PARAM_SIZE, SPTM_PAGE_SIZE);
+    u64 pt_attrs_pa = (u64)sptm_alloc_zero(&context.allocator, 6 * sizeof(u64), 8);
     u64 ttbr0_zero_page_pa =
-        (u64)sptm_boot_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+        (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
 
     u32 io_ranges_bytes, io_filters_bytes;
     const void *raw_io_ranges = adt_getprop(adt, defaults, "pmap-io-ranges", &io_ranges_bytes);
@@ -503,9 +450,9 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
     size_t io_ranges_size = ALIGN_UP(max(io_ranges_bytes, 1U), SPTM_PAGE_SIZE);
     size_t io_filters_size = ALIGN_UP(max(io_filters_bytes, 1U), SPTM_PAGE_SIZE);
     struct sptm_boot_io_range *io_ranges =
-        sptm_boot_alloc_zero(&context.allocator, io_ranges_size, SPTM_PAGE_SIZE);
+        sptm_alloc_zero(&context.allocator, io_ranges_size, SPTM_PAGE_SIZE);
     struct sptm_boot_io_filter *io_filters =
-        sptm_boot_alloc_zero(&context.allocator, io_filters_size, SPTM_PAGE_SIZE);
+        sptm_alloc_zero(&context.allocator, io_filters_size, SPTM_PAGE_SIZE);
     memcpy(io_ranges, raw_io_ranges, io_ranges_bytes);
     memcpy(io_filters, raw_io_filters, io_filters_bytes);
     u32 io_range_count = io_ranges_bytes / sizeof(*io_ranges);
@@ -524,9 +471,10 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
                         SPTM_LEAF_CODE);
     sptm_boot_map_range(&context, context.ttbr1_pa, context.physmap_base, context.managed_start,
                         context.managed_end - context.managed_start, data_leaf);
-    sptm_boot_retype_page(&context, context.ttbr1_pa,
-                          sptm_boot_va(&context, context.uat_global_root_pa),
-                          context.uat_global_root_pa, SPTM_LEAF_DATA_NC);
+    // Override the global UAT root's physmap alias as Normal-NC.
+    sptm_boot_map_page(&context, context.ttbr1_pa,
+                       sptm_boot_va(&context, context.uat_global_root_pa),
+                       context.uat_global_root_pa, SPTM_LEAF_DATA_NC);
 
     // XNU expects the locked ADT and TrustCache as EXTRADATA just below the kernelcache.
     u64 trustcache_pa, trustcache_size;
@@ -543,8 +491,8 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
                         data_leaf);
     bootargs->devtree = (void *)(extradata_va + guest_adt - extradata_pa);
 
-    context.uat_l2_pa = sptm_boot_adt_integer(sgx, "gfx-shared-l2-region-base", 0);
-    u64 uat_l2_size = sptm_boot_adt_integer(sgx, "gfx-shared-l2-region-size", 0);
+    context.uat_l2_pa = sptm_adt_integer(sgx, "gfx-shared-l2-region-base", 0);
+    u64 uat_l2_size = sptm_adt_integer(sgx, "gfx-shared-l2-region-size", 0);
     // XNU adopts these empty L3s before normal pmap allocation is operational.
     // The fixed 64 MiB term stands in for the boot framebuffer size.
     u64 memory_segments = ALIGN_UP(bootargs->mem_size, BIT(28)) >> 28;
@@ -564,7 +512,7 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
     for (size_t frame = 0; frame < managed_pages; frame++)
         context.frame_table[frame * SPTM_FRAME_ENTRY_SIZE + 2] = SPTM_FRAME_DEFAULT;
     context.frame_priority =
-        sptm_boot_alloc_zero(&context.allocator, managed_pages, SPTM_CACHE_LINE_SIZE);
+        sptm_alloc_zero(&context.allocator, managed_pages, SPTM_CACHE_LINE_SIZE);
     sptm_boot_type_kernel_frames(&context);
     // INIT_STATE never sees these objects; the root also owns its shared-L2 link.
     sptm_boot_set_frame(&context, context.uat_global_root_pa, SPTM_FRAME_XNU_IOMMU, 0, 0, 0, 0, 2);
@@ -582,7 +530,7 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
     // libsptm interprets kind 2 as a table body and kind 5 as a data body.
     for (u32 type = 0; type < 256; type++)
         ((u8 *)frame_params_pa)[type * SPTM_FRAME_PARAM_SIZE + 1] =
-            sptm_boot_table_frame(type) ? 2 : 5;
+            sptm_is_table_type(type) ? 2 : 5;
     // Recover stripped pt-attr globals from stable anchors, in XNU's ABI order:
     // 16K, 4K, 16K kernel, then 16K, 16K-36b, and 4K stage 2.
     u64 *pt_attrs = (void *)pt_attrs_pa;
@@ -615,9 +563,8 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
     cpu = cpus;
     ADT_FOREACH_CHILD(adt, cpu)
     {
-        u32 logical = sptm_boot_adt_integer(cpu, "cpu-id", 0);
-        write32(context.cpu_map_pa + (logical + 1) * sizeof(u32),
-                sptm_boot_adt_integer(cpu, "reg", 0));
+        u32 logical = sptm_adt_integer(cpu, "cpu-id", 0);
+        write32(context.cpu_map_pa + (logical + 1) * sizeof(u32), sptm_adt_integer(cpu, "reg", 0));
     }
     for (u32 index = 0; index < cpu_count; index++)
         write64(txm_stack_array_pa + index * sizeof(u64),
@@ -649,7 +596,7 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
     write64((u64)bootstrap + 0x50, context.kernel_vmin);
     write64((u64)bootstrap + 0x58, context.kernel_vmax);
     write64((u64)bootstrap + 0x60, sptm_boot_va(&context, debug_header_pa));
-    write32((u64)bootstrap + 0x68, sptm_boot_adt_integer(defaults, "pmap-max-asids", 256));
+    write32((u64)bootstrap + 0x68, sptm_adt_integer(defaults, "pmap-max-asids", 256));
     memcpy(bootstrap + 0x6c, "randseed", 8);
     memcpy(bootstrap + 0x74, adt_getprop(adt, chosen, "random-seed", NULL), 256);
     write64((u64)bootstrap + 0x178, 0x108);
@@ -710,10 +657,10 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
                    (u64)uat_mapping_limit << 32 | (u64)uat_tlbi_at_retype << 48;
     hv_sptm_configure_uat(context.uat_l2_pa, uat_l2_size, uat_info, context.uat_global_state_pa,
                           context.uat_gpu_region_pa, context.uat_l2_va);
-    hv_sptm_configure_uat_handoff(sptm_boot_adt_integer(sgx, "gfx-handoff-base", 0),
-                                  sptm_boot_adt_integer(sgx, "gfx-handoff-size", 0));
+    hv_sptm_configure_uat_handoff(sptm_adt_integer(sgx, "gfx-handoff-base", 0),
+                                  sptm_adt_integer(sgx, "gfx-handoff-size", 0));
     hv_sptm_configure_txm(context.txm_info_va);
-    sptm_init_platform(guest_adt, context.allocator.next, context.allocator.end);
+    sptm_init_platform(&context.allocator);
 
     sptm_boot.entry = context.kernel_entry;
     sptm_boot.bootargs_va = sptm_boot_va(&context, bootargs_pa);

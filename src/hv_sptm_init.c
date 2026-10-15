@@ -11,11 +11,6 @@
 #define DART_TCR_APF_BYPASS     BIT(2)
 #define DART_TCR_REMAP_ENABLE   BIT(7)
 
-struct sptm_init_allocator {
-    u64 next;
-    u64 end;
-};
-
 struct sptm_init_instances {
     u64 base[SPTM_INIT_MAX_INSTANCES];
     u64 size[SPTM_INIT_MAX_INSTANCES];
@@ -28,34 +23,6 @@ struct sptm_init_tunable {
     u64 mask;
     u64 value;
 } PACKED;
-
-static void *sptm_init_alloc(struct sptm_init_allocator *allocator, size_t size, size_t alignment)
-{
-    u64 address = ALIGN_UP(allocator->next, alignment);
-    assert(address + size <= allocator->end);
-    allocator->next = address + size;
-    return (void *)address;
-}
-
-static void *sptm_init_alloc_zero(struct sptm_init_allocator *allocator, size_t size,
-                                  size_t alignment)
-{
-    void *result = sptm_init_alloc(allocator, size, alignment);
-    memset(result, 0, size);
-    return result;
-}
-
-static u64 sptm_adt_integer(int node, const char *name, u64 fallback)
-{
-    u32 size;
-    const void *value = adt_getprop(adt, node, name, &size);
-    if (!value)
-        return fallback;
-
-    u64 result = 0;
-    memcpy(&result, value, min(size, (u32)sizeof(result)));
-    return result;
-}
 
 static bool sptm_adt_has(int node, const char *name)
 {
@@ -282,7 +249,7 @@ static u32 sptm_dart_flags(int node, const char *name)
     return result;
 }
 
-static void sptm_init_darts(struct sptm_init_allocator *allocator)
+static void sptm_init_darts(struct sptm_allocator *allocator)
 {
     int path[8];
     int arm_io = adt_path_offset_trace(adt, "/arm-io", path);
@@ -304,13 +271,11 @@ static void sptm_init_darts(struct sptm_init_allocator *allocator)
             continue;
 
         u32 sid_count = sptm_adt_integer(node, "sid-count", 16);
-        struct sptm_dart_sid *states =
-            sptm_init_alloc_zero(allocator, sid_count * sizeof(*states), 16);
-        struct sptm_dart_dapf *dapf =
-            sptm_init_alloc(allocator, SPTM_MAX_DART_DAPF * sizeof(*dapf), 16);
+        struct sptm_dart_sid *states = sptm_alloc_zero(allocator, sid_count * sizeof(*states), 16);
+        struct sptm_dart_dapf *dapf = sptm_alloc(allocator, SPTM_MAX_DART_DAPF * sizeof(*dapf), 16);
         struct sptm_dart_tunable *tunables =
-            sptm_init_alloc(allocator, SPTM_MAX_DART_TUNABLES * sizeof(*tunables), 16);
-        u64 *clocks = sptm_init_alloc(allocator, SPTM_MAX_DART_CLOCKS * sizeof(*clocks), 16);
+            sptm_alloc(allocator, SPTM_MAX_DART_TUNABLES * sizeof(*tunables), 16);
+        u64 *clocks = sptm_alloc(allocator, SPTM_MAX_DART_CLOCKS * sizeof(*clocks), 16);
         const char *name = adt_get_name(adt, node);
 
         sptm_dart_sid_states(node, name, states, sid_count);
@@ -348,7 +313,7 @@ static void sptm_init_sart(void)
     hv_sptm_configure_sart(base, canary, info);
 }
 
-static void sptm_init_nvme(struct sptm_init_allocator *allocator)
+static void sptm_init_nvme(struct sptm_allocator *allocator)
 {
     int ans_path[8];
     int ans = adt_path_offset_trace(adt, "/arm-io/ans", ans_path);
@@ -368,11 +333,10 @@ static void sptm_init_nvme(struct sptm_init_allocator *allocator)
     u32 queue_entries = sptm_adt_integer(ans, "nvme-queue-entries", 64);
     u64 tcb_bytes = ALIGN_UP((u64)queue_entries * SPTM_NVME_TCB_SIZE, SPTM_NVME_TCB_ALIGNMENT);
     u64 prp_bytes = ALIGN_UP((u64)queue_entries * SPTM_NVME_PRP_SLOT_SIZE, SPTM_PAGE_SIZE);
-    void *admin_tcbs = sptm_init_alloc_zero(allocator, tcb_bytes, SPTM_PAGE_SIZE);
-    void *io_tcbs = sptm_init_alloc_zero(allocator, tcb_bytes, SPTM_PAGE_SIZE);
-    void *prp_scratch = sptm_init_alloc_zero(allocator, prp_bytes, SPTM_PAGE_SIZE);
-    void *command_state =
-        sptm_init_alloc_zero(allocator, queue_entries * SPTM_NVME_COMMAND_SIZE, 16);
+    void *admin_tcbs = sptm_alloc_zero(allocator, tcb_bytes, SPTM_PAGE_SIZE);
+    void *io_tcbs = sptm_alloc_zero(allocator, tcb_bytes, SPTM_PAGE_SIZE);
+    void *prp_scratch = sptm_alloc_zero(allocator, prp_bytes, SPTM_PAGE_SIZE);
+    void *command_state = sptm_alloc_zero(allocator, queue_entries * SPTM_NVME_COMMAND_SIZE, 16);
 
     bool tl_wa = sptm_adt_has(ans, "nvme-tl-wa");
     bool vdma_wa = sptm_adt_has(ans, "nvme-vdma-wa");
@@ -385,7 +349,7 @@ static void sptm_init_nvme(struct sptm_init_allocator *allocator)
     u64 trusted[2];
     ADT_GETPROP_ARRAY(adt, carveouts, "region-id-55", trusted);
 
-    u64 *config = sptm_init_alloc_zero(allocator, SPTM_NVME_CONFIG_WORDS * sizeof(*config), 16);
+    u64 *config = sptm_alloc_zero(allocator, SPTM_NVME_CONFIG_WORDS * sizeof(*config), 16);
     config[0] = queue_bar;
     config[1] = main_bar + 0x28000;
     config[2] = trusted[0];
@@ -410,13 +374,10 @@ static void sptm_init_nvme(struct sptm_init_allocator *allocator)
     hv_sptm_configure_nvme((u64)config);
 }
 
-void sptm_init_platform(u64 guest_adt, u64 aux_start, u64 aux_end)
+// The caller has already switched adt to the guest device tree.
+void sptm_init_platform(struct sptm_allocator *allocator)
 {
-    struct sptm_init_allocator allocator = {aux_start, aux_end};
-    void *firmware_adt = adt;
-    adt = (void *)guest_adt;
     sptm_init_sart();
-    sptm_init_nvme(&allocator);
-    sptm_init_darts(&allocator);
-    adt = firmware_adt;
+    sptm_init_nvme(allocator);
+    sptm_init_darts(allocator);
 }
