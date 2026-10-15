@@ -243,7 +243,6 @@ struct sptm_dart {
     u64 instances[SPTM_MAX_DART_INSTANCES];
     u32 boot_streams[(SPTM_MAX_DART_SIDS + 31) / 32];
     u32 saved_streams[SPTM_MAX_DART_INSTANCES][(SPTM_MAX_DART_SIDS + 31) / 32];
-    u32 active_streams[SPTM_MAX_DART_INSTANCES][(SPTM_MAX_DART_SIDS + 31) / 32];
     u32 saved_counters[SPTM_MAX_DART_INSTANCES][9];
     u32 saved_tlimit[SPTM_MAX_DART_INSTANCES];
     u32 saved_teqreserve[SPTM_MAX_DART_INSTANCES];

@@ -313,7 +313,6 @@ static bool sptm_dart_save_power_state(struct sptm_dart *dart)
             if (streams == DART_UNAVAILABLE || streams == UINT32_MAX)
                 return false;
             dart->saved_streams[index][word] = streams;
-            dart->active_streams[index][word] = streams;
         }
         for (size_t counter = 0; counter < dart->counter_count; counter++)
             dart->saved_counters[index][counter] = read32(base + counter_offsets[counter]);
@@ -333,11 +332,9 @@ static void sptm_dart_disable_translating_streams(struct sptm_dart *dart)
     }
     for (size_t index = 0; index < dart->instance_count; index++) {
         for (size_t word = 0; word < dart->sid_words; word++) {
-            if (translating[word]) {
+            if (translating[word])
                 write32(dart->instances[index] + DART_DISABLE_STREAMS + word * sizeof(u32),
                         translating[word]);
-                dart->active_streams[index][word] &= ~translating[word];
-            }
         }
     }
     sysop("dsb sy");
@@ -362,10 +359,8 @@ static void sptm_dart_restore_runtime_state(struct sptm_dart *dart)
         for (size_t word = 0; word < dart->sid_words; word++) {
             u32 streams =
                 dart->saved_valid ? dart->saved_streams[index][word] : dart->boot_streams[word];
-            if (streams) {
+            if (streams)
                 write32(base + DART_ENABLE_STREAMS + word * sizeof(u32), streams);
-                dart->active_streams[index][word] |= streams;
-            }
         }
     }
     sysop("dsb sy");

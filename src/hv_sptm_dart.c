@@ -588,14 +588,8 @@ static bool sptm_dart_set_stream(struct exc_info *ctx, bool enable)
     u32 bit = BIT(sid % 32);
     if (dart->powered) {
         u64 register_offset = enable ? DART_ENABLE_STREAMS : DART_DISABLE_STREAMS;
-        for (size_t index = 0; index < dart->instance_count; index++) {
-            u64 base = dart->instances[index];
-            write32(base + register_offset + word * sizeof(u32), bit);
-            if (enable)
-                dart->active_streams[index][word] |= bit;
-            else
-                dart->active_streams[index][word] &= ~bit;
-        }
+        for (size_t index = 0; index < dart->instance_count; index++)
+            write32(dart->instances[index] + register_offset + word * sizeof(u32), bit);
     } else {
         /* Endpoint 5 will restore the deferred stream state after power-up. */
         if (dart->saved_valid) {
@@ -718,8 +712,6 @@ void sptm_dart_configure(const struct sptm_dart_config *config)
         if (state && (state->flags & SPTM_DART_SID_ENABLED))
             dart->boot_streams[sid / 32] |= BIT(sid % 32);
     }
-    for (size_t index = 0; index < dart->instance_count; index++)
-        memcpy(dart->active_streams[index], dart->boot_streams, sizeof(dart->boot_streams));
     dart->valid = true;
     memcpy(dart->instances, config->instances, sizeof(dart->instances));
 }
