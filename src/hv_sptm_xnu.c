@@ -40,30 +40,49 @@ static void sptm_serial_flush(void)
     sptm_serial_line_len = 0;
 }
 
+static void sptm_serial_putc(u8 character)
+{
+    if (!character || character == '\n' || character == '\r') {
+        sptm_serial_flush();
+        return;
+    }
+    if (sptm_serial_line_len == sizeof(sptm_serial_line) - 1)
+        sptm_serial_flush();
+    sptm_serial_line[sptm_serial_line_len++] = character;
+}
+
+static bool sptm_switch_root(struct exc_info *ctx)
+{
+    u64 root = ctx->regs[0] & 0x0000ffffffffffffULL;
+    struct sptm_surt_root *surt = sptm_find_surt_root(root);
+    u8 type = SPTM_FRAME_SUBPAGE;
+    u64 asid;
+    if (surt) {
+        asid = surt->asid;
+    } else {
+        u8 *entry = sptm_frame_entry(root);
+        if (!entry || !sptm_is_root_type(entry[2]))
+            return false;
+        type = entry[2];
+        asid = read16((u64)entry + 10);
+    }
+
+    if (type == SPTM_FRAME_KERNEL_ROOT)
+        msr(TTBR1_EL12, root);
+    else
+        msr(TTBR0_EL12, root | (asid << 48));
+    sptm_publish_stage1();
+    ctx->regs[0] = SPTM_STATUS_SUCCESS;
+    return true;
+}
+
 bool sptm_handle_xnu_bootstrap(struct exc_info *ctx, u32 endpoint)
 {
-    if (endpoint == 45) { /* SPTM_SERIAL_PUTC */
-        u8 character = ctx->regs[0];
-        if (!character || character == '\n' || character == '\r') {
-            sptm_serial_flush();
-        } else {
-            if (sptm_serial_line_len == sizeof(sptm_serial_line) - 1)
-                sptm_serial_flush();
-            sptm_serial_line[sptm_serial_line_len++] = character;
-        }
-        ctx->regs[0] = SPTM_STATUS_SUCCESS;
-        return true;
-    }
-
-    if (endpoint == 46) { /* SPTM_SERIAL_DISABLE */
-        sptm_serial_flush();
-        ctx->regs[0] = SPTM_STATUS_SUCCESS;
-        return true;
-    }
-
     switch (endpoint) {
         case 0:  /* LOCKDOWN */
+        case 12: /* CONFIGURE_ROOT */
         case 15: /* FIXUPS_COMPLETE */
+        case 18: /* REGISTER_EXC_RETURN */
         case 20: /* SLIDE_REGION */
         case 23: /* REG_WRITE */
         case 28: /* GUEST_EXIT */
@@ -78,9 +97,6 @@ bool sptm_handle_xnu_bootstrap(struct exc_info *ctx, u32 endpoint)
         case 49: /* REG_SNAPSHOT */
             ctx->regs[0] = SPTM_STATUS_SUCCESS;
             return true;
-        case 12: /* CONFIGURE_ROOT */
-            ctx->regs[0] = SPTM_STATUS_SUCCESS;
-            return true;
         case 1: /* RETYPE */
             return sptm_retype_frame(ctx);
         case 2: /* MAP_PAGE */
@@ -93,34 +109,29 @@ bool sptm_handle_xnu_bootstrap(struct exc_info *ctx, u32 endpoint)
             return sptm_update_region(ctx);
         case 6: /* UPDATE_DISJOINT */
             return sptm_update_disjoint(ctx);
-        case 21: /* UPDATE_DISJOINT_MULTIPAGE */
-            return sptm_update_disjoint_multipage(ctx);
         case 7: /* UNMAP_REGION */
             return sptm_unmap_region(ctx);
         case 8: /* UNMAP_DISJOINT */
             return sptm_unmap_disjoint(ctx);
         case 9: /* CONFIGURE_SHAREDREGION */
             return sptm_configure_shared_region(ctx);
-        case 10: { /* NEST_REGION */
-            bool handled = sptm_nest_region(ctx, true);
-            if (handled)
-                sptm_publish_commpage_policy();
-            return handled;
-        }
+        case 10: /* NEST_REGION */
+            if (!sptm_nest_region(ctx, true))
+                return false;
+            sptm_publish_commpage_policy();
+            return true;
         case 11: /* UNNEST_REGION */
             return sptm_nest_region(ctx, false);
-        case 14: { /* REGISTER_CPU */
-            struct sptm_cpu *cpu = sptm_register_cpu(ctx->regs[0]);
-            if (!cpu)
+        case 13: /* SWITCH_ROOT */
+            return sptm_switch_root(ctx);
+        case 14: /* REGISTER_CPU */
+            if (!sptm_register_cpu(ctx->regs[0]))
                 return false;
             ctx->regs[0] = SPTM_STATUS_SUCCESS;
             return true;
-        }
         case 16: /* SIGN_USER_POINTER */
         case 17: /* AUTH_USER_POINTER */
-            return true;
-        case 18: /* REGISTER_EXC_RETURN */
-            ctx->regs[0] = SPTM_STATUS_SUCCESS;
+            /* Pointer-valued calls: leave x0 as the unmodified pointer. */
             return true;
         case 19: { /* CPU_ID */
             struct sptm_cpu *cpu = sptm_find_cpu(ctx->regs[0]);
@@ -129,6 +140,8 @@ bool sptm_handle_xnu_bootstrap(struct exc_info *ctx, u32 endpoint)
             ctx->regs[0] = cpu->logical_id;
             return true;
         }
+        case 21: /* UPDATE_DISJOINT_MULTIPAGE */
+            return sptm_update_disjoint_multipage(ctx);
         case 22: /* REG_READ */
             ctx->regs[0] = 0;
             return true;
@@ -156,31 +169,14 @@ bool sptm_handle_xnu_bootstrap(struct exc_info *ctx, u32 endpoint)
             return sptm_condemn_leaf_table(ctx, true);
         case 44: /* UNCONDEMN_LEAF_TABLE */
             return sptm_condemn_leaf_table(ctx, false);
-        case 13: { /* SWITCH_ROOT */
-            u64 root = ctx->regs[0] & 0x0000ffffffffffffULL;
-            struct sptm_surt_root *surt = sptm_find_surt_root(root);
-            u8 *entry = NULL;
-            u8 type = SPTM_FRAME_SUBPAGE;
-            u64 asid;
-            if (surt) {
-                asid = surt->asid;
-            } else {
-                entry = sptm_frame_entry(root);
-                if (!entry || !sptm_is_root_type(entry[2]))
-                    return false;
-                type = entry[2];
-                asid = read16((u64)entry + 10);
-            }
-
-            if (type == SPTM_FRAME_KERNEL_ROOT) {
-                msr(TTBR1_EL12, root);
-            } else {
-                msr(TTBR0_EL12, root | (asid << 48));
-            }
-            sptm_publish_stage1();
+        case 45: /* SPTM_SERIAL_PUTC */
+            sptm_serial_putc(ctx->regs[0]);
             ctx->regs[0] = SPTM_STATUS_SUCCESS;
             return true;
-        }
+        case 46: /* SPTM_SERIAL_DISABLE */
+            sptm_serial_flush();
+            ctx->regs[0] = SPTM_STATUS_SUCCESS;
+            return true;
         default:
             return false;
     }
