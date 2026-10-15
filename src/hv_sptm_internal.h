@@ -441,7 +441,7 @@ u64 sptm_adt_integer(int node, const char *name, u64 fallback);
 void sptm_init_platform(struct sptm_allocator *allocator);
 
 /* Core */
-bool sptm_valid_pa(u64 pa, size_t size);
+bool sptm_is_managed_range(u64 pa, size_t size);
 bool sptm_valid_platform_pa(u64 pa, size_t size);
 u64 sptm_pointer_pa(u64 pointer, size_t size);
 u64 sptm_iommu_table_va(u64 pa);
@@ -479,7 +479,6 @@ bool sptm_handle_uat(struct exc_info *ctx, u32 endpoint);
 
 /* Stage-1 pmap */
 struct sptm_surt_root *sptm_find_surt_root(u64 root);
-u64 sptm_walk(u64 root, u64 va, unsigned int target_level, struct sptm_geometry *geometry_out);
 void sptm_publish_stage1(void);
 void sptm_publish_commpage_policy(void);
 bool sptm_retype_frame(struct exc_info *ctx);

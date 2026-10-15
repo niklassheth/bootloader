@@ -49,7 +49,8 @@ static bool sptm_root_geometry(u64 root, struct sptm_geometry *geometry)
     return true;
 }
 
-u64 sptm_walk(u64 root, u64 va, unsigned int target_level, struct sptm_geometry *geometry_out)
+static u64 sptm_walk(u64 root, u64 va, unsigned int target_level,
+                     struct sptm_geometry *geometry_out)
 {
     static const unsigned int shifts_16k[] = {0, 36, 25, 14};
     static const unsigned int shifts_4k[] = {39, 30, 21, 12};
@@ -64,7 +65,7 @@ u64 sptm_walk(u64 root, u64 va, unsigned int target_level, struct sptm_geometry 
 
     for (unsigned int level = geometry.start_level; level < target_level; level++) {
         u64 slot = table + (((va >> shifts[level]) & geometry.entries_mask) * sizeof(u64));
-        if (!sptm_valid_pa(slot, sizeof(u64)))
+        if (!sptm_is_managed_range(slot, sizeof(u64)))
             return 0;
 
         u64 descriptor = read64(slot);
@@ -75,7 +76,7 @@ u64 sptm_walk(u64 root, u64 va, unsigned int target_level, struct sptm_geometry 
     }
 
     u64 slot = table + (((va >> shifts[target_level]) & geometry.entries_mask) * sizeof(u64));
-    if (!sptm_valid_pa(slot, sizeof(u64)))
+    if (!sptm_is_managed_range(slot, sizeof(u64)))
         return 0;
 
     if (geometry_out)
@@ -544,7 +545,7 @@ bool sptm_update_disjoint_multipage(struct exc_info *ctx)
         if (inner_count > slots - used || !sptm_update_mask(options))
             return false;
 
-        if (!(options & BIT(9)) && paddr >= sptm.managed_start && paddr < sptm.managed_end) {
+        if (!(options & BIT(9)) && sptm_is_managed_range(paddr, 1)) {
             u64 physmap_va = sptm.physmap_base + paddr - sptm.managed_start;
             if (!sptm_walk(sptm.kernel_root, physmap_va, 3, NULL))
                 return false;
@@ -577,7 +578,7 @@ bool sptm_update_disjoint_multipage(struct exc_info *ctx)
             u64 options = read32(header + 20);
 
             if (!(options & BIT(9)) && !(paddr & SPTM_PAGE_MASK) &&
-                sptm_valid_pa(paddr, SPTM_PAGE_SIZE)) {
+                sptm_is_managed_range(paddr, SPTM_PAGE_SIZE)) {
                 u64 tagged = paddr;
                 if ((papt_template & (7ULL << 2)) != PTE_MAIR_IDX(1))
                     tagged |= restore_tag;
@@ -643,7 +644,7 @@ bool sptm_update_disjoint_multipage(struct exc_info *ctx)
         deferred |= options & BIT(8);
 
         // Keep the physmap memory type in sync unless SKIP_PAPT is set.
-        if (!(options & BIT(9)) && paddr >= sptm.managed_start && paddr < sptm.managed_end) {
+        if (!(options & BIT(9)) && sptm_is_managed_range(paddr, 1)) {
             u64 physmap_va = sptm.physmap_base + paddr - sptm.managed_start;
             u64 physmap_slot = sptm_walk(sptm.kernel_root, physmap_va, 3, NULL);
             u64 old = read64(physmap_slot);

@@ -4,7 +4,7 @@
 
 static bool sptm_nvme_xnu_default_range(u64 pa, size_t size)
 {
-    if (!size || !sptm_valid_pa(pa, size))
+    if (!size || !sptm_is_managed_range(pa, size))
         return false;
 
     u64 first = pa & ~SPTM_PAGE_MASK;

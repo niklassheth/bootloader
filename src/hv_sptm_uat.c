@@ -6,7 +6,7 @@ static bool sptm_uat_valid_table(u64 pa)
 {
     if (pa & SPTM_PAGE_MASK)
         return false;
-    if (sptm_valid_pa(pa, SPTM_PAGE_SIZE))
+    if (sptm_is_managed_range(pa, SPTM_PAGE_SIZE))
         return true;
     return pa == sptm.uat_shared_l2_pa;
 }
@@ -20,7 +20,7 @@ static u64 sptm_uat_state_pa(u64 handle)
 {
     if (!sptm.uat_configured)
         return 0;
-    if ((handle & SPTM_PAGE_MASK) || !sptm_valid_pa(handle, SPTM_PAGE_SIZE))
+    if ((handle & SPTM_PAGE_MASK) || !sptm_is_managed_range(handle, SPTM_PAGE_SIZE))
         return 0;
     return handle;
 }
@@ -585,7 +585,7 @@ static bool sptm_uat_map_begin(struct exc_info *ctx)
     u64 segments_pa = 0;
     if (size) {
         segments_pa = ctx->regs[2];
-        if (!sptm_valid_pa(segments_pa, size)) {
+        if (!sptm_is_managed_range(segments_pa, size)) {
             printf("HV: SPTM UAT MAP_PAGE rejected segment pointer "
                    "0x%lx+0x%lx managed=0x%lx..0x%lx\n",
                    segments_pa, size, sptm.managed_start, sptm.managed_end);
@@ -800,7 +800,7 @@ static bool sptm_uat_unmap_begin(struct exc_info *ctx)
     u64 segments_pa = 0;
     if (size) {
         segments_pa = ctx->regs[1];
-        if (!sptm_valid_pa(segments_pa, size) ||
+        if (!sptm_is_managed_range(segments_pa, size) ||
             !sptm_uat_validate_unmap_segments(segments_pa, segment_count))
             return false;
     }

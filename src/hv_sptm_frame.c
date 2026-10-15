@@ -39,7 +39,7 @@ bool sptm_is_root_type(u8 type)
 
 u8 *sptm_frame_entry(u64 pa)
 {
-    if ((pa & SPTM_PAGE_MASK) || !sptm_valid_pa(pa, SPTM_PAGE_SIZE))
+    if ((pa & SPTM_PAGE_MASK) || !sptm_is_managed_range(pa, SPTM_PAGE_SIZE))
         return NULL;
 
     u64 index = (pa - sptm.managed_start) >> SPTM_PAGE_SHIFT;

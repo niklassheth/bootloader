@@ -86,7 +86,7 @@ static struct sptm_dart_sid *sptm_dart_translating_sid(const struct sptm_dart *d
 
 bool sptm_dart_valid_table(const struct sptm_dart_sid *state, u64 pa, size_t size)
 {
-    if (sptm_valid_pa(pa, size)) {
+    if (sptm_is_managed_range(pa, size)) {
         u64 start = pa & ~SPTM_PAGE_MASK;
         u64 end = ALIGN_UP(pa + size, SPTM_PAGE_SIZE);
 

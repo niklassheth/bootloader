@@ -6,7 +6,8 @@
 
 struct sptm_state sptm;
 
-bool sptm_valid_pa(u64 pa, size_t size)
+// Whether [pa, pa + size) lies in XNU-managed RAM, which has frame-table entries.
+bool sptm_is_managed_range(u64 pa, size_t size)
 {
     return pa >= sptm.managed_start && pa < sptm.managed_end && size <= sptm.managed_end - pa;
 }
@@ -40,7 +41,7 @@ u64 sptm_pointer_pa(u64 pointer, size_t size)
         return 0;
     }
 
-    return sptm_valid_pa(pa, size) ? pa : 0;
+    return sptm_is_managed_range(pa, size) ? pa : 0;
 }
 
 u64 sptm_iommu_table_va(u64 pa)
