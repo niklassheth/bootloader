@@ -14,7 +14,7 @@ static struct sptm_dart *sptm_find_dart(u32 id)
     return NULL;
 }
 
-static bool sptm_dart_tlb_op(struct sptm_dart *dart, u32 op, u64 start, u64 end)
+static bool sptm_dart_tlb_op(struct sptm_dart *dart, u32 op)
 {
     // TLB registers are inaccessible while the DART is powered down.
     if (!dart->powered)
@@ -23,10 +23,6 @@ static bool sptm_dart_tlb_op(struct sptm_dart *dart, u32 op, u64 start, u64 end)
     sysop("dsb sy");
     for (size_t index = 0; index < dart->instance_count; index++) {
         u64 base = dart->instances[index];
-        if (op & DART_TLB_FLUSH_DVA) {
-            write32(base + DART_TLB_START_DVA, start >> SPTM_PAGE_SHIFT);
-            write32(base + DART_TLB_END_DVA, (end - 1) >> SPTM_PAGE_SHIFT);
-        }
         write32(base + DART_TLB_OP, op);
         size_t retry = 0;
         while (read32(base + DART_TLB_OP) & DART_TLB_BUSY) {
@@ -41,30 +37,15 @@ static bool sptm_dart_tlb_op(struct sptm_dart *dart, u32 op, u64 start, u64 end)
     return true;
 }
 
+// Every leaf or table change flushes the whole SID rather than a DVA range.
 static bool sptm_dart_flush_sid(struct sptm_dart *dart, u32 sid)
 {
-    return sptm_dart_tlb_op(dart, DART_TLB_FLUSH_SID | sid, 0, 0);
-}
-
-static bool sptm_dart_flush_range(struct sptm_dart *dart, u32 sid, u64 start, u64 end)
-{
-    if (!(dart->flags & SPTM_DART_FLUSH_BY_DVA) || !dart->hardware_flush_supported)
-        return sptm_dart_flush_sid(dart, sid);
-    return sptm_dart_tlb_op(
-        dart, DART_TLB_HARDWARE_FLUSH | DART_TLB_FLUSH_DVA | DART_TLB_FLUSH_SID | sid, start, end);
-}
-
-// Flush the DVA range covered by one entry of a level-`level` table.
-static bool sptm_dart_flush_entry(struct sptm_dart *dart, u32 sid, u64 dva, u32 level)
-{
-    u64 span = BIT(sptm_dart_shifts[level]);
-    u64 start = dva & ~(span - 1);
-    return sptm_dart_flush_range(dart, sid, start, start + span);
+    return sptm_dart_tlb_op(dart, DART_TLB_FLUSH_SID | sid);
 }
 
 bool sptm_dart_flush_all(struct sptm_dart *dart)
 {
-    return sptm_dart_tlb_op(dart, DART_TLB_FLUSH_ALL, 0, 0);
+    return sptm_dart_tlb_op(dart, DART_TLB_FLUSH_ALL);
 }
 
 static u64 sptm_dart_desc_pa(u64 descriptor)
@@ -114,38 +95,26 @@ static bool sptm_dart_set_table(struct exc_info *ctx, struct sptm_dart *dart, bo
     u32 level = ctx->regs[3];
     u64 table_pa = map ? ctx->regs[4] : 0;
     struct sptm_dart_sid *state = &dart->sid_states[sid];
-    bool flushed;
 
     if (level == state->root_level) {
         sptm_dart_set_ttbr(dart, sid,
                            map ? ((table_pa >> 12) & 0xfffffffcULL) | DART_TTBR_VALID : 0);
         state->root = table_pa;
-        flushed = sptm_dart_flush_sid(dart, sid);
     } else {
         write64(sptm_dart_slot(state, dva, level - 1), map ? sptm_dart_desc(table_pa) : 0);
-        flushed = sptm_dart_flush_entry(dart, sid, dva, level - 1);
     }
 
-    if (flushed)
-        ctx->regs[0] = SPTM_STATUS_SUCCESS;
-    return flushed;
+    if (!sptm_dart_flush_sid(dart, sid))
+        return false;
+    ctx->regs[0] = SPTM_STATUS_SUCCESS;
+    return true;
 }
 
-static u64 sptm_dart_page_pte(const struct sptm_dart *dart, u64 dva, u64 size, u64 page_dva,
-                              u64 target, u64 options)
+// Leaves expose their whole page: the subpage range is 4-byte units 0 to 0xfff.
+static u64 sptm_dart_page_pte(u64 target, u64 options)
 {
-    // Restrict the leaf to the 4-byte subpages inside [dva, dva + size).
-    u64 sp_start = (max(dva, page_dva) - page_dva) >> 2;
-    u64 sp_end = (min(dva + size, page_dva + SPTM_PAGE_SIZE) - page_dva - 1) >> 2;
-    bool wrprot = options & BIT(1);
-    u8 *frame = sptm_frame_entry(target);
-    if (frame && (dart->flags & SPTM_DART_RELAXED_RW))
-        wrprot |= frame[2] == 14 || frame[2] == 15 || frame[2] == 16 ||
-                  frame[2] == SPTM_FRAME_COPROCESSOR_RO_IO;
-
-    return ((sp_start & 0xfff) << 52) | ((sp_end & 0xfff) << 40) | sptm_dart_desc(target) |
-           (options & BIT(0) ? DART_PTE_RDPROT : 0) | (wrprot ? DART_PTE_WRPROT : 0) |
-           (options & BIT(2) ? DART_PTE_UNCACHABLE : 0);
+    return (0xfffULL << 40) | sptm_dart_desc(target) | (options & BIT(0) ? DART_PTE_RDPROT : 0) |
+           (options & BIT(1) ? DART_PTE_WRPROT : 0) | (options & BIT(2) ? DART_PTE_UNCACHABLE : 0);
 }
 
 static bool sptm_dart_map_pages(struct exc_info *ctx, struct sptm_dart *dart)
@@ -159,23 +128,17 @@ static bool sptm_dart_map_pages(struct exc_info *ctx, struct sptm_dart *dart)
     u64 start = dva & ~SPTM_PAGE_MASK;
     u64 end = ALIGN_UP(dva + size, SPTM_PAGE_SIZE);
     bool changed = false;
-    bool all_fresh = true;
 
     for (u64 page_dva = start; page_dva < end; page_dva += SPTM_PAGE_SIZE) {
         u64 target = read64(targets + ((page_dva - start) >> SPTM_PAGE_SHIFT) * sizeof(u64));
         u64 slot = sptm_dart_slot(state, page_dva, 2);
-        u64 old = read64(slot);
-        u64 pte = sptm_dart_page_pte(dart, dva, size, page_dva, target, options);
-
-        all_fresh &= !(old & DART_PTE_VALID);
-        changed |= old != pte;
+        u64 pte = sptm_dart_page_pte(target, options);
+        changed |= read64(slot) != pte;
         write64(slot, pte);
     }
     sysop("dsb sy");
 
-    bool skip_fresh = (dart->flags & SPTM_DART_AVOID_MAP_TLBI) && all_fresh;
-    if (changed && !(options & BIT(3)) && !skip_fresh &&
-        !sptm_dart_flush_range(dart, sid, start, end))
+    if (changed && !sptm_dart_flush_sid(dart, sid))
         return false;
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
@@ -201,7 +164,7 @@ static bool sptm_dart_unmap_pages(struct exc_info *ctx, struct sptm_dart *dart)
     }
     sysop("dsb sy");
 
-    if (changed && !sptm_dart_flush_range(dart, sid, start, end))
+    if (changed && !sptm_dart_flush_sid(dart, sid))
         return false;
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;

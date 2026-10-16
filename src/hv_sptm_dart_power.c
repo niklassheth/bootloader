@@ -2,10 +2,6 @@
 
 #include "hv_sptm_internal.h"
 
-static const u16 sptm_dart_counter_offsets[] = {
-    0x760, 0x764, 0x768, 0x770, 0x774, 0x778, 0x780, 0x784, 0x788,
-};
-
 // Powered-down or absent DART registers read as DART_UNAVAILABLE or all ones.
 static bool sptm_dart_live(u32 value)
 {
@@ -255,12 +251,7 @@ bool sptm_dart_init(struct exc_info *ctx, struct sptm_dart *dart)
     u8 minor = params_8 & 0xff;
     dart->sid_exceptions = major > 2 || (major == 2 && minor >= 2);
     dart->sid_words = ((params_c & 0x1ff) + 31) / 32;
-    dart->counter_count = major >= 2 ? 9 : 6;
     dart->interrupt_status_offset = dart->sid_exceptions ? 0x164 : 0x160;
-    dart->hardware_flush_supported = true;
-    for (size_t index = 0; index < dart->instance_count; index++)
-        dart->hardware_flush_supported &=
-            !!(read32(dart->instances[index] + DART_PARAMS_4) & BIT(3));
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
 }
@@ -275,9 +266,6 @@ static bool sptm_dart_save_power_state(struct sptm_dart *dart)
                 return false;
             dart->saved_streams[index][word] = streams;
         }
-        for (size_t counter = 0; counter < dart->counter_count; counter++)
-            dart->saved_counters[index][counter] =
-                read32(base + sptm_dart_counter_offsets[counter]);
     }
     dart->saved_valid = true;
     return true;
@@ -309,11 +297,6 @@ static void sptm_dart_restore_runtime_state(struct sptm_dart *dart)
         if (dart->limits_valid && dart->saved_valid) {
             write32(base + DART_TEQRESERVE, dart->saved_teqreserve[index]);
             write32(base + DART_TLIMIT, dart->saved_tlimit[index]);
-        }
-        if (dart->saved_valid) {
-            for (size_t counter = 0; counter < dart->counter_count; counter++)
-                write32(base + sptm_dart_counter_offsets[counter],
-                        dart->saved_counters[index][counter]);
         }
         for (size_t word = 0; word < dart->sid_words; word++) {
             u32 streams =

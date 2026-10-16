@@ -63,12 +63,9 @@
 #define NVME_IOSQ            0x1200
 #define NVME_IOCQ            0x1208
 #define NVME_IOQA            0x1210
-#define DART_PARAMS_4        0x004
 #define DART_PARAMS_8        0x008
 #define DART_PARAMS_C        0x00c
 #define DART_TLB_OP          0x080
-#define DART_TLB_START_DVA   0x098
-#define DART_TLB_END_DVA     0x0a0
 #define DART_ERROR           0x100
 #define DART_REG_PROTECT     0x200
 #define DART_TLIMIT          0x228
@@ -81,9 +78,7 @@
 #define DART_UNAVAILABLE     0xabad1dea
 
 #define DART_TLB_BUSY           BIT(31)
-#define DART_TLB_HARDWARE_FLUSH BIT(30)
 #define DART_TLB_FLUSH_SID      BIT(8)
-#define DART_TLB_FLUSH_DVA      BIT(14)
 #define DART_TLB_FLUSH_ALL      0
 #define DART_TCR_TRANSLATE      BIT(0)
 #define DART_TTBR_VALID         BIT(0)
@@ -150,14 +145,9 @@
 #define SPTM_DART_SID_POLICY  BIT(2)
 #define SPTM_DART_SID_EXCLAVE BIT(3)
 
-#define SPTM_DART_FLUSH_BY_DVA     BIT(0)
-#define SPTM_DART_AVOID_MAP_TLBI   BIT(1)
-#define SPTM_DART_RELAXED_RW       BIT(2)
-#define SPTM_DART_RETENTION        BIT(3)
-#define SPTM_DART_ALLOW_PTE_REMAP  BIT(4)
-#define SPTM_DART_CLAMP_TLIMITS    BIT(5)
-#define SPTM_DART_IGNORE_SECONDARY BIT(6)
-#define SPTM_DART_UNGANG_SHARED_PS BIT(7)
+#define SPTM_DART_RETENTION        BIT(0)
+#define SPTM_DART_IGNORE_SECONDARY BIT(1)
+#define SPTM_DART_UNGANG_SHARED_PS BIT(2)
 
 #define SPTM_FRAME_KERNEL_CODE             6
 #define SPTM_FRAME_KERNEL_ROOT             8
@@ -225,13 +215,10 @@ struct sptm_dart {
     u64 instances[SPTM_MAX_DART_INSTANCES];
     u32 boot_streams[(SPTM_MAX_DART_SIDS + 31) / 32];
     u32 saved_streams[SPTM_MAX_DART_INSTANCES][(SPTM_MAX_DART_SIDS + 31) / 32];
-    u32 saved_counters[SPTM_MAX_DART_INSTANCES][9];
     u32 saved_tlimit[SPTM_MAX_DART_INSTANCES];
     u32 saved_teqreserve[SPTM_MAX_DART_INSTANCES];
     bool sid_exceptions;
-    u8 counter_count;
     u16 interrupt_status_offset;
-    bool hardware_flush_supported;
     bool saved_valid;
     bool limits_valid;
     bool powered;

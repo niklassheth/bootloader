@@ -223,32 +223,11 @@ static u32 sptm_dart_clocks(int node, const struct sptm_init_instances *trad,
     return count;
 }
 
-static u32 sptm_dart_flags(int node, const char *name)
+static u32 sptm_dart_flags(int node)
 {
-    static const struct {
-        const char *property;
-        u32 flag;
-    } flags[] = {
-        {"flush-by-dva", SPTM_DART_FLUSH_BY_DVA},
-        {"avoid-tlbi-in-map", SPTM_DART_AVOID_MAP_TLBI},
-        {"relaxed-rw-protections", SPTM_DART_RELAXED_RW},
-        {"retention", SPTM_DART_RETENTION},
-        {"allow-pte-remap", SPTM_DART_ALLOW_PTE_REMAP},
-        {"clamp-tlimits", SPTM_DART_CLAMP_TLIMITS},
-        {"ignore-secondary", SPTM_DART_IGNORE_SECONDARY},
-        {"dart-ungang-shared-ps", SPTM_DART_UNGANG_SHARED_PS},
-    };
-    u32 result = 0;
-    for (size_t index = 0; index < ARRAY_SIZE(flags); index++) {
-        if (sptm_adt_has(node, flags[index].property))
-            result |= flags[index].flag;
-    }
-
-    if (!cpu_features->apple_sysregs_unlocked &&
-        (!strcmp(name, "dart-apcie0") || !strcmp(name, "dart-apcie2") ||
-         !strcmp(name, "dart-pmp") || !strcmp(name, "dart-usb2")))
-        result &= ~SPTM_DART_FLUSH_BY_DVA;
-    return result;
+    return (sptm_adt_has(node, "retention") ? SPTM_DART_RETENTION : 0) |
+           (sptm_adt_has(node, "ignore-secondary") ? SPTM_DART_IGNORE_SECONDARY : 0) |
+           (sptm_adt_has(node, "dart-ungang-shared-ps") ? SPTM_DART_UNGANG_SHARED_PS : 0);
 }
 
 static void sptm_init_darts(struct sptm_allocator *allocator)
@@ -288,7 +267,7 @@ static void sptm_init_darts(struct sptm_allocator *allocator)
         dart->sid_count = sid_count;
         dart->instance_count = trad.count;
         memcpy(dart->instances, trad.base, sizeof(dart->instances));
-        dart->flags = sptm_dart_flags(node, name);
+        dart->flags = sptm_dart_flags(node);
         dart->dapf_entries = dapf;
         dart->dapf_count = sptm_dart_dapf(node, &fpad, dapf);
         dart->clock_entries = clocks;
