@@ -95,22 +95,32 @@ static void sptm_uat_write_descriptor(u64 slot, u64 descriptor)
 }
 
 // UAT tables, and state objects, are pinned through the frame's IOMMU refcount.
-static bool sptm_uat_ref_table(u64 pa, int delta)
+static void sptm_uat_ref_table(u64 pa, int delta)
 {
-    return sptm_adjust_frame_u16(sptm_frame_entry(pa & SPTM_DESC_PA_MASK_16K), 4, delta);
+    sptm_adjust_frame_u16(sptm_frame_entry(pa & SPTM_DESC_PA_MASK_16K), 4, delta);
 }
 
 // The firmware-owned shared L2 is not a UAT table frame and is never refcounted.
-static bool sptm_uat_ref_parent(u64 pa, int delta)
+static void sptm_uat_ref_parent(u64 pa, int delta)
 {
     pa &= SPTM_DESC_PA_MASK_16K;
-    return pa == sptm.uat_shared_l2_pa || sptm_uat_ref_table(pa, delta);
+    if (pa != sptm.uat_shared_l2_pa)
+        sptm_uat_ref_table(pa, delta);
 }
 
-static bool sptm_uat_ref_page(u64 descriptor, int delta)
+static void sptm_uat_ref_page(u64 descriptor, int delta)
 {
     // Track UAT leaves through the frame header's common in_use count.
-    return sptm_adjust_iommu_use(descriptor & SPTM_DESC_PA_MASK_16K, delta);
+    sptm_adjust_iommu_use(descriptor & SPTM_DESC_PA_MASK_16K, delta);
+}
+
+// A state object pins itself and its roots; single-root states have a sentinel root1.
+static void sptm_uat_ref_state(u64 state_pa, u64 root0, u64 root1, int delta)
+{
+    sptm_uat_ref_table(state_pa, delta);
+    sptm_uat_ref_table(root0, delta);
+    if (!sptm_uat_sentinel(root1))
+        sptm_uat_ref_table(root1, delta);
 }
 
 static u64 sptm_uat_normalize_va(u64 va)
@@ -165,19 +175,7 @@ static bool sptm_uat_init_state(struct exc_info *ctx)
     u64 root1 = ctx->regs[2];
     bool dual = !sptm_uat_sentinel(root1);
 
-    u64 roots[] = {state_pa, root0, root1};
-    size_t root_count = dual ? ARRAY_SIZE(roots) : ARRAY_SIZE(roots) - 1;
-    size_t pinned = 0;
-    for (; pinned < root_count; pinned++) {
-        if (!sptm_uat_ref_table(roots[pinned], 1))
-            break;
-    }
-    if (pinned != root_count) {
-        while (pinned)
-            sptm_uat_ref_table(roots[--pinned], -1);
-        return false;
-    }
-
+    sptm_uat_ref_state(state_pa, root0, root1, 1);
     memset((void *)state_pa, 0, SPTM_PAGE_SIZE);
     write8(state_pa, dual ? UAT_STATE_DUAL_ROOT : UAT_STATE_SINGLE_ROOT);
     write64(state_pa + UAT_STATE_ROOT0, root0);
@@ -191,12 +189,8 @@ static bool sptm_uat_init_state(struct exc_info *ctx)
 static bool sptm_uat_destroy_state(struct exc_info *ctx)
 {
     u64 state_pa = ctx->regs[0];
-    u64 root0 = read64(state_pa + UAT_STATE_ROOT0);
-    u64 root1 = read64(state_pa + UAT_STATE_ROOT1);
-    u64 roots[] = {state_pa, root0, root1};
-    size_t root_count = sptm_uat_sentinel(root1) ? 2 : ARRAY_SIZE(roots);
-    for (size_t index = 0; index < root_count; index++)
-        sptm_uat_ref_table(roots[index], -1);
+    sptm_uat_ref_state(state_pa, read64(state_pa + UAT_STATE_ROOT0),
+                       read64(state_pa + UAT_STATE_ROOT1), -1);
 
     memset((void *)state_pa, 0, SPTM_PAGE_SIZE);
     write64(state_pa + UAT_STATE_ROOT0, UINT32_MAX);
@@ -214,13 +208,8 @@ static bool sptm_uat_map_table(struct exc_info *ctx)
     u64 table_pa = ctx->regs[3] & SPTM_DESC_PA_MASK_16K;
     u64 parent_pa = slot & ~(REGION_NORMAL_NC | SPTM_PAGE_MASK);
 
-    if (!sptm_uat_ref_table(table_pa, 1))
-        return false;
-    if (!sptm_uat_ref_parent(parent_pa, 1)) {
-        sptm_uat_ref_table(table_pa, -1);
-        return false;
-    }
-
+    sptm_uat_ref_table(table_pa, 1);
+    sptm_uat_ref_parent(parent_pa, 1);
     sptm_uat_write_descriptor(slot, table_pa | UAT_DESC_TABLE);
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
@@ -292,8 +281,8 @@ static bool sptm_uat_map_continue(struct exc_info *ctx)
             bool old_valid = old_descriptor & UAT_DESC_VALID;
             bool changes_frame = !old_valid || (old_descriptor & SPTM_DESC_PA_MASK_16K) !=
                                                    (descriptor & SPTM_DESC_PA_MASK_16K);
-            if (changes_frame && !sptm_uat_ref_page(descriptor, 1))
-                return false;
+            if (changes_frame)
+                sptm_uat_ref_page(descriptor, 1);
 
             sptm_uat_write_descriptor(slot, descriptor);
             if (old_valid) {

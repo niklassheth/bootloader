@@ -339,7 +339,6 @@ struct sptm_state {
     u64 kernel_root;
     u64 panic_state_pa;
     u64 frame_table_pa;
-    u64 external_ref_table_pa;
     u64 uat_global_state;
     u64 uat_gpu_contexts;
     u64 uat_shared_l2_pa;
@@ -362,7 +361,6 @@ struct sptm_state {
     u16 sart_guard_count;
     bool sart_exclusive_bounds;
     spinlock_t service_lock;
-    spinlock_t frame_lock;
     struct sptm_cpu cpus[MAX_CPUS];
     u32 hv_phys_ids[MAX_CPUS];
     u8 cpu_count;
@@ -407,14 +405,13 @@ bool sptm_handle_dart(struct exc_info *ctx, u32 endpoint);
 bool sptm_is_table_type(u8 type);
 bool sptm_is_root_type(u8 type);
 u8 *sptm_frame_entry(u64 pa);
-u32 *sptm_external_ref_entry(u64 pa);
-bool sptm_adjust_frame_u16(u8 *entry, size_t offset, int delta);
-bool sptm_adjust_data_ref(u64 pa, bool writable, int delta);
-bool sptm_adjust_data_range(u64 pa, u64 size, bool writable, int delta);
-bool sptm_adjust_iommu_use(u64 pa, int delta);
-bool sptm_adjust_table_valid(u64 slot, int delta);
-bool sptm_adjust_parent_links(u64 child, int delta);
-bool sptm_adjust_mapping_ref(u64 pte, u64 descriptor_mask, int delta);
+void sptm_adjust_frame_u16(u8 *entry, size_t offset, int delta);
+void sptm_adjust_data_ref(u64 pa, bool writable, int delta);
+void sptm_adjust_data_range(u64 pa, u64 size, bool writable, int delta);
+void sptm_adjust_iommu_use(u64 pa, int delta);
+void sptm_adjust_table_valid(u64 slot, int delta);
+void sptm_adjust_parent_links(u64 child, int delta);
+void sptm_adjust_mapping_ref(u64 pte, u64 descriptor_mask, int delta);
 
 /* UAT */
 void sptm_uat_configure(u64 global_root_pa, u64 shared_l2_size, u64 handoff_pa, u64 handoff_size);

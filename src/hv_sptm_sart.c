@@ -39,11 +39,7 @@ static bool sptm_sart_map(struct exc_info *ctx)
         return false;
     }
 
-    if (!sptm_adjust_data_range(pa, size, permission != 0, 1)) {
-        spin_unlock(&sptm.service_lock);
-        return false;
-    }
-
+    sptm_adjust_data_range(pa, size, permission != 0, 1);
     if (guard) {
         if (!sptm.sart_guard_count && sptm.sart_canary)
             write32(sptm.sart_canary, 0xabfedeed);

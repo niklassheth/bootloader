@@ -365,7 +365,6 @@ u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text
     memset(&sptm_boot, 0, sizeof(sptm_boot));
     memset(&sptm, 0, sizeof(sptm));
     spin_init(&sptm.service_lock);
-    spin_init(&sptm.frame_lock);
     void *firmware_adt = adt;
     adt = (void *)guest_adt;
 
@@ -411,7 +410,6 @@ u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text
 
     size_t managed_pages = (context.managed_end - context.managed_start) / SPTM_PAGE_SIZE;
     size_t frame_table_size = managed_pages * SPTM_FRAME_ENTRY_SIZE;
-    size_t external_ref_table_size = managed_pages * 8;
 
     context.bootstrap_pa = sptm_boot_alloc(&context, SPTM_BOOTSTRAP_SIZE, 16);
     u64 debug_header_pa = sptm_boot_alloc(&context, 0x100, 16);
@@ -430,9 +428,7 @@ u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text
     context.uat_global_state_pa = sptm_boot_alloc_page(&context);
     context.uat_global_root_pa = sptm_boot_alloc_page(&context);
     u64 kernel_stacks_pa = sptm_boot_alloc(&context, SPTM_CPU_STACK_WINDOW_SIZE, SPTM_PAGE_SIZE);
-    // Keep EL2-only RO/WX reservations after the ABI-visible frame table.
-    context.frame_table_pa =
-        sptm_boot_alloc(&context, frame_table_size + external_ref_table_size, SPTM_PAGE_SIZE);
+    context.frame_table_pa = sptm_boot_alloc(&context, frame_table_size, SPTM_PAGE_SIZE);
     context.frame_table = (void *)context.frame_table_pa;
     u64 frame_params_pa = sptm_boot_alloc(&context, 256 * SPTM_FRAME_PARAM_SIZE, SPTM_PAGE_SIZE);
     u64 pt_attrs_pa = sptm_boot_alloc(&context, 6 * sizeof(u64), 8);
@@ -651,7 +647,6 @@ u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text
     sptm.kernel_root = context.ttbr1_pa;
     sptm.max_cpus = cpu_count;
     sptm.frame_table_pa = context.frame_table_pa;
-    sptm.external_ref_table_pa = context.frame_table_pa + frame_table_size;
     sptm.panic_state_pa = context.panic_state_pa;
     sptm.txm_info_va = context.txm_info_va;
     sptm.sprr_perm[0] = 0x2010002030100000;

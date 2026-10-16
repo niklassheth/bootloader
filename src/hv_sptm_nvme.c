@@ -28,14 +28,8 @@ static bool sptm_nvme_map_pages(struct exc_info *ctx)
     write64((u64)template + 0x20, 0);
 
     // Pin every DMA target for the lifetime of the command.
-    bool writable = dma_flags & BIT(0);
-    for (size_t acquired = 0; acquired < count; acquired++) {
-        if (sptm_adjust_data_ref(read64(segment_pa + acquired * sizeof(u64)), writable, 1))
-            continue;
-        while (acquired--)
-            sptm_adjust_data_ref(read64(segment_pa + acquired * sizeof(u64)), writable, -1);
-        return false;
-    }
+    for (size_t index = 0; index < count; index++)
+        sptm_adjust_data_ref(read64(segment_pa + index * sizeof(u64)), dma_flags & BIT(0), 1);
 
     // PRP1 is the first target; PRP2 is the second target or a list of the rest.
     u64 first = count ? read64(segment_pa) : 0;
@@ -141,14 +135,9 @@ static bool sptm_nvme_unmap_pages(struct exc_info *ctx)
         return true;
     }
 
-    bool writable = command->dma_flags & BIT(0);
-    for (size_t released = 0; released < command->count; released++) {
-        if (sptm_adjust_data_ref(sptm_nvme_command_target(command, released), writable, -1))
-            continue;
-        while (released--)
-            sptm_adjust_data_ref(sptm_nvme_command_target(command, released), writable, 1);
-        return false;
-    }
+    for (size_t index = 0; index < command->count; index++)
+        sptm_adjust_data_ref(sptm_nvme_command_target(command, index), command->dma_flags & BIT(0),
+                             -1);
 
     if (command->count > 2) {
         memset((void *)command->prp_aux, 0, SPTM_NVME_PRP_SLOT_SIZE);

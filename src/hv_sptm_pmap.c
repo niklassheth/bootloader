@@ -165,29 +165,7 @@ bool sptm_retype_frame(struct exc_info *ctx)
     if (!entry)
         return false;
 
-    spin_lock(&sptm.frame_lock);
     u8 old_type = entry[2];
-    u16 in_use = read16((u64)entry);
-    u32 ro_refcount = read32((u64)entry + 8);
-    u32 wx_refcount = read32((u64)entry + 12);
-    u32 *external = sptm_external_ref_entry(pa);
-    u32 external_ro = external[0];
-    u32 external_wx = external[1];
-    if (new_type != old_type && (in_use || external_ro || external_wx)) {
-        printf("HV: SPTM refusing RETYPE of externally referenced frame "
-               "pa=0x%lx %u->%u in-use=%u ro=%u/%u wx=%u/%u\n",
-               pa, old_type, new_type, in_use, ro_refcount, external_ro, wx_refcount, external_wx);
-        spin_unlock(&sptm.frame_lock);
-        return false;
-    }
-    if (old_type == SPTM_FRAME_XNU_IOMMU && new_type != SPTM_FRAME_XNU_IOMMU &&
-        read16((u64)entry + 4)) {
-        printf("HV: SPTM refusing RETYPE of pinned UAT frame "
-               "pa=0x%lx refs=%u new-type=%u\n",
-               pa, read16((u64)entry + 4), new_type);
-        spin_unlock(&sptm.frame_lock);
-        return false;
-    }
     bool entering_iommu = old_type != SPTM_FRAME_XNU_IOMMU &&
                           new_type == SPTM_FRAME_XNU_IOMMU;
     bool leaving_iommu = old_type == SPTM_FRAME_XNU_IOMMU &&
@@ -241,7 +219,6 @@ bool sptm_retype_frame(struct exc_info *ctx)
         sptm.commpage_rw[sptm.commpage_rw_count++] = pa;
     }
 
-    spin_unlock(&sptm.frame_lock);
     if (sptm_is_table_type(old_type) || sptm_is_table_type(new_type) || iommu_transition ||
         new_type == SPTM_FRAME_XNU_IOMMU || new_type == SPTM_FRAME_XNU_IO ||
         new_type == SPTM_FRAME_PROTECTED_IO || new_type == SPTM_FRAME_COPROCESSOR_RO_IO ||
@@ -304,14 +281,9 @@ bool sptm_map_page(struct exc_info *ctx)
         return true;
     }
 
-    bool fresh = !(old & 1) && (pte & 1);
-    if (fresh) {
-        if (!sptm_adjust_mapping_ref(pte, geometry.descriptor_mask, 1))
-            return false;
-        if (!sptm_adjust_table_valid(slot, 1)) {
-            sptm_adjust_mapping_ref(pte, geometry.descriptor_mask, -1);
-            return false;
-        }
+    if (!(old & 1) && (pte & 1)) {
+        sptm_adjust_mapping_ref(pte, geometry.descriptor_mask, 1);
+        sptm_adjust_table_valid(slot, 1);
     }
 
     ctx->regs[0] = old & 1 ? SPTM_STATUS_MAP_VALID : SPTM_STATUS_SUCCESS;
@@ -349,8 +321,7 @@ bool sptm_map_table(struct exc_info *ctx)
 
     u64 child = tte & geometry.descriptor_mask;
     u64 attrs = tte & ~geometry.descriptor_mask;
-    if (!sptm_adjust_parent_links(child, 1))
-        return false;
+    sptm_adjust_parent_links(child, 1);
     for (size_t index = 0; index < geometry.page_ratio; index++) {
         u64 entry = slot + index * sizeof(u64);
         u64 replacement =
@@ -367,9 +338,7 @@ bool sptm_unmap_table(struct exc_info *ctx)
     struct sptm_geometry geometry;
     u64 slot = sptm_walk(ctx->regs[0], ctx->regs[1], ctx->regs[2], &geometry);
     slot &= ~(geometry.page_ratio * sizeof(u64) - 1);
-    u64 child = read64(slot) & geometry.descriptor_mask;
-    if (!sptm_adjust_parent_links(child, -1))
-        return false;
+    sptm_adjust_parent_links(read64(slot) & geometry.descriptor_mask, -1);
     for (size_t index = 0; index < geometry.page_ratio; index++)
         write64(slot + index * sizeof(u64), 0);
     sptm_publish_stage1();
@@ -386,21 +355,16 @@ static void sptm_update_leaf(u64 slot, u64 template, u64 mask, u64 scratch)
 }
 
 // Clear a leaf if it is mapped, recording the displaced PTE in scratch.
-static bool sptm_unmap_leaf(u64 slot, u64 descriptor_mask, u64 scratch, bool *changed)
+static void sptm_unmap_leaf(u64 slot, u64 descriptor_mask, u64 scratch, bool *changed)
 {
     u64 old = slot ? read64(slot) : 0;
     write64(scratch, old);
     if (!(old & 1))
-        return true;
-    if (!sptm_adjust_mapping_ref(old, descriptor_mask, -1))
-        return false;
-    if (!sptm_adjust_table_valid(slot, -1)) {
-        sptm_adjust_mapping_ref(old, descriptor_mask, 1);
-        return false;
-    }
+        return;
+    sptm_adjust_mapping_ref(old, descriptor_mask, -1);
+    sptm_adjust_table_valid(slot, -1);
     write64(slot, 0);
     *changed = true;
-    return true;
 }
 
 static u64 sptm_update_mask(u64 flags)
@@ -549,11 +513,9 @@ bool sptm_unmap_region(struct exc_info *ctx)
     u64 page_size = BIT(geometry.page_shift);
     u64 scratch = sptm_scratch_pa(ctx);
     bool changed = false;
-    for (size_t index = 0; index < count; index++) {
-        if (!sptm_unmap_leaf(sptm_walk(root, start + index * page_size, 3, NULL),
-                             geometry.descriptor_mask, scratch + index * sizeof(u64), &changed))
-            return false;
-    }
+    for (size_t index = 0; index < count; index++)
+        sptm_unmap_leaf(sptm_walk(root, start + index * page_size, 3, NULL),
+                        geometry.descriptor_mask, scratch + index * sizeof(u64), &changed);
 
     return sptm_finish_update(ctx, changed, changed && (options & BIT(8)));
 }
@@ -568,9 +530,7 @@ bool sptm_unmap_disjoint(struct exc_info *ctx)
         u64 op = ops + index * 24;
         struct sptm_geometry geometry;
         u64 slot = sptm_walk(read64(op), read64(op + 8), 3, &geometry);
-        if (!sptm_unmap_leaf(slot, geometry.descriptor_mask, scratch + index * sizeof(u64),
-                             &changed))
-            return false;
+        sptm_unmap_leaf(slot, geometry.descriptor_mask, scratch + index * sizeof(u64), &changed);
     }
 
     return sptm_finish_update(ctx, changed, false);
