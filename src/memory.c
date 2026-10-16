@@ -543,38 +543,38 @@ static size_t mmu_sort_unique_pages(u64 *pages, size_t count)
     return unique;
 }
 
-static void mmu_map_ram_page_alias(u64 *pages, size_t count,
-                                   u64 region, u64 attributes, bool valid)
+/*
+ * (Un)map [pa, pa + size) at m1n1's four ordinary RAM aliases with one memory
+ * type. Live IOMMU tables also get a dedicated Normal-NC alias that is never WB.
+ */
+static void mmu_map_ram_aliases(u64 pa, u64 size, u8 attribute_index, bool valid, bool dedicated)
 {
-    size_t first = 0;
+    static const u64 aliases[][2] = {
+        {0, PERM_RWX},
+        {REGION_RWX_EL0, PERM_RWX_EL0},
+        {REGION_RW_EL0, PERM_RW_EL0},
+        {REGION_RX_EL1, PERM_RX_EL0},
+    };
+    u64 attributes = PTE_MAIR_IDX(attribute_index) | PTE_ACCESS | PTE_VALID |
+                     (attribute_index == MAIR_IDX_NORMAL_NC ? PTE_SH_NS : PTE_SH_OS);
 
-    while (first < count) {
-        size_t end = first + 1;
-        while (end < count && pages[end] == pages[end - 1] + PAGE_SIZE)
-            end++;
-
-        u64 from = pages[first] | region;
-        u64 to = valid ? pages[first] | attributes : 0;
-        u64 size = (end - first) * PAGE_SIZE;
-
-        mmu_pt_map_l3(from, to, size);
-        first = end;
-    }
+    for (size_t index = 0; index < ARRAY_SIZE(aliases); index++)
+        mmu_pt_map_l3(pa | aliases[index][0], valid ? pa | attributes | aliases[index][1] : 0,
+                      size);
+    if (dedicated)
+        mmu_pt_map_l3(pa | REGION_NORMAL_NC, valid ? pa | attributes | PERM_RW : 0, size);
 }
 
-static void mmu_map_ram_page_aliases(u64 *pages, size_t count,
-                                     u8 attribute_index, bool valid)
+// Apply mmu_map_ram_aliases() to each contiguous run of a sorted page list.
+static void mmu_map_ram_page_aliases(u64 *pages, size_t count, u8 attribute_index, bool valid,
+                                     bool dedicated)
 {
-    u64 shareability = attribute_index == MAIR_IDX_NORMAL_NC ? PTE_SH_NS : PTE_SH_OS;
-    u64 common = PTE_MAIR_IDX(attribute_index) | PTE_ACCESS | PTE_VALID | shareability;
-
-    mmu_map_ram_page_alias(pages, count, 0, common | PERM_RWX, valid);
-    mmu_map_ram_page_alias(pages, count, REGION_RWX_EL0,
-                           common | PERM_RWX_EL0, valid);
-    mmu_map_ram_page_alias(pages, count, REGION_RW_EL0,
-                           common | PERM_RW_EL0, valid);
-    mmu_map_ram_page_alias(pages, count, REGION_RX_EL1,
-                           common | PERM_RX_EL0, valid);
+    for (size_t first = 0, end; first < count; first = end) {
+        for (end = first + 1; end < count && pages[end] == pages[end - 1] + PAGE_SIZE; end++)
+            ;
+        mmu_map_ram_aliases(pages[first], (end - first) * PAGE_SIZE, attribute_index, valid,
+                            dedicated);
+    }
 }
 
 static u64 mmu_get_mapping(u64 va)
@@ -608,146 +608,59 @@ static u64 mmu_get_mapping(u64 va)
     return l3d;
 }
 
-static bool mmu_ram_page_aliases_nc(u64 pa)
+static bool mmu_ram_page_has_type(u64 pa, u8 attribute_index)
 {
-    const u64 aliases[] = {
-        pa,
-        pa | REGION_RWX_EL0,
-        pa | REGION_RW_EL0,
-        pa | REGION_RX_EL1,
-    };
+    const u64 aliases[] = {pa, pa | REGION_RWX_EL0, pa | REGION_RW_EL0, pa | REGION_RX_EL1};
+    u64 shareability = attribute_index == MAIR_IDX_NORMAL_NC ? PTE_SH_NS : PTE_SH_OS;
 
     for (size_t index = 0; index < ARRAY_SIZE(aliases); index++) {
         u64 descriptor = mmu_get_mapping(aliases[index]);
         if (!(descriptor & PTE_VALID) ||
-            (descriptor & PTE_MAIR_IDX(7)) != PTE_MAIR_IDX(MAIR_IDX_NORMAL_NC) ||
-            (descriptor & (3ULL << 8)) != PTE_SH_NS)
+            (descriptor & PTE_MAIR_IDX(7)) != PTE_MAIR_IDX(attribute_index) ||
+            (descriptor & (3ULL << 8)) != shareability)
             return false;
     }
     return true;
 }
 
-static bool mmu_ram_page_aliases_wb(u64 pa)
+/*
+ * Switch RAM pages between Normal-WB and Normal-NC at all of m1n1's aliases,
+ * skipping pages already in the requested state. Arm requires the old aliases
+ * to be broken and invalidated before the new memory type is mapped.
+ */
+static void mmu_retype_ram_pages(u64 *pages, size_t count, u8 attribute_index, bool dedicated)
 {
-    const u64 aliases[] = {
-        pa,
-        pa | REGION_RWX_EL0,
-        pa | REGION_RW_EL0,
-        pa | REGION_RX_EL1,
-    };
-
-    for (size_t index = 0; index < ARRAY_SIZE(aliases); index++) {
-        u64 descriptor = mmu_get_mapping(aliases[index]);
-        if (!(descriptor & PTE_VALID) ||
-            (descriptor & PTE_MAIR_IDX(7)) != PTE_MAIR_IDX(MAIR_IDX_NORMAL) ||
-            (descriptor & (3ULL << 8)) != PTE_SH_OS)
-            return false;
-    }
-    return true;
-}
-
-static bool mmu_ram_page_has_nc_aperture(u64 pa)
-{
-    u64 descriptor = mmu_get_mapping(pa | REGION_NORMAL_NC);
-
-    return (descriptor & PTE_VALID) && (descriptor & PTE_TARGET_MASK) == pa &&
-           (descriptor & PTE_MAIR_IDX(7)) == PTE_MAIR_IDX(MAIR_IDX_NORMAL_NC) &&
-           !(descriptor & (3ULL << 8));
-}
-
-static void mmu_validate_ram_page(u64 pa, const char *operation)
-{
-    if ((pa & (PAGE_SIZE - 1)) || pa < ram_base || pa >= ram_base + mem_size_actual ||
-        PAGE_SIZE > ram_base + mem_size_actual - pa)
-        panic("Invalid RAM page 0x%lx in %s\n", pa, operation);
-}
-
-size_t mmu_map_ram_pages_nc(u64 *pages, size_t count, bool dedicated_alias)
-{
-    if (!count)
-        return 0;
-
     size_t pending = 0;
     for (size_t index = 0; index < count; index++) {
-        mmu_validate_ram_page(pages[index], "Normal-NC remap");
-        bool has_aperture = mmu_ram_page_has_nc_aperture(pages[index]);
-        if (mmu_ram_page_aliases_nc(pages[index])) {
-            if (has_aperture != dedicated_alias)
-                panic("Normal-NC RAM page 0x%lx has unexpected dedicated-alias state\n",
-                      pages[index]);
-            continue;
-        }
-        if (has_aperture)
-            panic("Cacheable RAM page 0x%lx retains its dedicated NC alias\n",
-                  pages[index]);
-        pages[pending++] = pages[index];
+        if (!mmu_ram_page_has_type(pages[index], attribute_index))
+            pages[pending++] = pages[index];
     }
     count = mmu_sort_unique_pages(pages, pending);
     if (!count)
-        return 0;
+        return;
 
     // Retire cacheable state before changing any of m1n1's aliases.
-    for (size_t index = 0; index < count; index++)
-        dc_civac_range((void *)pages[index], PAGE_SIZE);
-    sysop("dsb sy");
-
-    // Break-before-make the four cacheable aliases as one batch.
-    mmu_map_ram_page_aliases(pages, count, 0, false);
-    mmu_publish_mappings();
-
-    mmu_map_ram_page_aliases(pages, count, MAIR_IDX_NORMAL_NC, true);
-    if (dedicated_alias) {
-        // Give live IOMMU tables a dedicated alias which has never been WB.
-        u64 attributes = PTE_MAIR_IDX(MAIR_IDX_NORMAL_NC) | PTE_ACCESS |
-                         PTE_VALID | PTE_SH_NS | PERM_RW;
-        mmu_map_ram_page_alias(pages, count, REGION_NORMAL_NC, attributes, true);
+    if (attribute_index == MAIR_IDX_NORMAL_NC) {
+        for (size_t index = 0; index < count; index++)
+            dc_civac_range((void *)pages[index], PAGE_SIZE);
+        sysop("dsb sy");
     }
-    mmu_publish_mappings();
 
-    return count;
+    mmu_map_ram_page_aliases(pages, count, 0, false, dedicated);
+    mmu_publish_mappings();
+    mmu_map_ram_page_aliases(pages, count, attribute_index, true,
+                             dedicated && attribute_index == MAIR_IDX_NORMAL_NC);
+    mmu_publish_mappings();
 }
 
-size_t mmu_restore_ram_pages_wb(u64 *pages, size_t count, bool dedicated_alias)
+void mmu_map_ram_pages_nc(u64 *pages, size_t count, bool dedicated_alias)
 {
-    if (!count)
-        return 0;
+    mmu_retype_ram_pages(pages, count, MAIR_IDX_NORMAL_NC, dedicated_alias);
+}
 
-    size_t pending = 0;
-    for (size_t index = 0; index < count; index++) {
-        mmu_validate_ram_page(pages[index], "Normal-WB alias restoration");
-        if (mmu_ram_page_aliases_wb(pages[index])) {
-            if (mmu_ram_page_has_nc_aperture(pages[index]))
-                panic("Normal-WB RAM page 0x%lx retains its dedicated NC alias\n",
-                      pages[index]);
-            continue;
-        }
-        pages[pending++] = pages[index];
-    }
-    count = mmu_sort_unique_pages(pages, pending);
-    if (!count)
-        return 0;
-
-    /* Break first to follow Arm's required memory-type transition ordering. */
-    for (size_t index = 0; index < count; index++) {
-        if (!mmu_ram_page_aliases_nc(pages[index]) ||
-            mmu_ram_page_has_nc_aperture(pages[index]) != dedicated_alias)
-            panic("Unexpected RAM/dedicated-alias state restoring 0x%lx to Normal-WB\n",
-                  pages[index]);
-    }
-
-    if (dedicated_alias) {
-        /* Retire the never-WB aperture before ordinary aliases become WB. */
-        mmu_map_ram_page_alias(pages, count, REGION_NORMAL_NC, 0, false);
-        mmu_publish_mappings();
-    }
-
-    mmu_map_ram_page_aliases(pages, count, 0, false);
-    mmu_publish_mappings();
-
-    mmu_map_ram_page_aliases(pages, count, MAIR_IDX_NORMAL, true);
-    mmu_publish_mappings();
-
-    return count;
+void mmu_restore_ram_pages_wb(u64 *pages, size_t count, bool dedicated_alias)
+{
+    mmu_retype_ram_pages(pages, count, MAIR_IDX_NORMAL, dedicated_alias);
 }
 
 static void mmu_map_mmio(void)
@@ -811,44 +724,19 @@ static void mmu_remap_ranges(void)
     }
 }
 
-static void mmu_map_nc_aliases(u64 addr, size_t size, const char *name);
-
 void mmu_map_framebuffer(u64 addr, size_t size)
 {
+    u64 start = ALIGN_DOWN(addr, PAGE_SIZE);
+    u64 map_size = ALIGN_UP(addr + size, PAGE_SIZE) - start;
+
+    printf("MMU: Adding Normal-NC mappings at 0x%lx..0x%lx for framebuffer\n", start,
+           start + map_size);
     dc_civac_range((void *)addr, size);
     sysop("dsb sy");
-    mmu_map_nc_aliases(addr, size, "framebuffer");
-}
-
-static void mmu_map_nc_aliases(u64 addr, size_t size, const char *name)
-{
-    u64 start = ALIGN_DOWN(addr, PAGE_SIZE);
-    u64 end = ALIGN_UP(addr + size, PAGE_SIZE);
-    size_t map_size = end - start;
-
-    if (!addr || !size)
-        return;
-
-    printf("MMU: Adding Normal-NC mappings at 0x%lx..0x%lx for %s\n",
-           start, end, name);
-
-    // Break all live aliases before changing the framebuffer from WB to NC.
-    if (mmu_active()) {
-        if (mmu_map(start, 0, map_size) < 0 ||
-            mmu_map(start | REGION_RWX_EL0, 0, map_size) < 0 ||
-            mmu_map(start | REGION_RW_EL0, 0, map_size) < 0 ||
-            mmu_map(start | REGION_RX_EL1, 0, map_size) < 0)
-            panic("Failed to break live mappings for %s\n", name);
-        mmu_publish_mappings();
-    }
-
-    mmu_add_mapping(start, start, map_size, MAIR_IDX_NORMAL_NC, PERM_RWX);
-    mmu_add_mapping(start | REGION_RWX_EL0, start, map_size,
-                    MAIR_IDX_NORMAL_NC, PERM_RWX_EL0);
-    mmu_add_mapping(start | REGION_RW_EL0, start, map_size,
-                    MAIR_IDX_NORMAL_NC, PERM_RW_EL0);
-    mmu_add_mapping(start | REGION_RX_EL1, start, map_size,
-                    MAIR_IDX_NORMAL_NC, PERM_RX_EL0);
+    mmu_map_ram_aliases(start, map_size, 0, false, false);
+    mmu_publish_mappings();
+    mmu_map_ram_aliases(start, map_size, MAIR_IDX_NORMAL_NC, true, false);
+    mmu_publish_mappings();
 }
 
 static void mmu_add_default_mappings(void)
