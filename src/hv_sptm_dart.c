@@ -165,16 +165,9 @@ static bool sptm_dart_map_pages(struct exc_info *ctx, struct sptm_dart *dart)
         u64 target = read64(targets + ((page_dva - start) >> SPTM_PAGE_SHIFT) * sizeof(u64));
         u64 slot = sptm_dart_slot(state, page_dva, 2);
         u64 old = read64(slot);
-        u64 old_target = (old & DART_PTE_VALID) ? sptm_dart_desc_pa(old) : 0;
         u64 pte = sptm_dart_page_pte(dart, dva, size, page_dva, target, options);
 
-        // Pin the new target before the leaf can reach it.
-        if (old_target != target) {
-            sptm_adjust_iommu_use(target, 1);
-            if (old_target)
-                sptm_adjust_iommu_use(old_target, -1);
-        }
-        all_fresh &= !old_target;
+        all_fresh &= !(old & DART_PTE_VALID);
         changed |= old != pte;
         write64(slot, pte);
     }
@@ -203,7 +196,6 @@ static bool sptm_dart_unmap_pages(struct exc_info *ctx, struct sptm_dart *dart)
         u64 old = read64(slot);
         if (!(old & DART_PTE_VALID))
             continue;
-        sptm_adjust_iommu_use(sptm_dart_desc_pa(old), -1);
         write64(slot, 0);
         changed = true;
     }

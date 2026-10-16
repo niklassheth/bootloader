@@ -24,12 +24,6 @@ static bool sptm_nvme_map_pages(struct exc_info *ctx)
     memcpy(template, (void *)sptm_pointer_pa(ctx->regs[2]), sizeof(template));
     u8 dma_flags = template[0x01];
     template[0x02] = cid;
-    write64((u64)template + 0x18, 0);
-    write64((u64)template + 0x20, 0);
-
-    // Pin every DMA target for the lifetime of the command.
-    for (size_t index = 0; index < count; index++)
-        sptm_adjust_data_ref(read64(segment_pa + index * sizeof(u64)), dma_flags & BIT(0), 1);
 
     // PRP1 is the first target; PRP2 is the second target or a list of the rest.
     u64 first = count ? read64(segment_pa) : 0;
@@ -49,11 +43,7 @@ static bool sptm_nvme_map_pages(struct exc_info *ctx)
     write64((u64)template + 0x18, first);
     write64((u64)template + 0x20, prp_aux);
 
-    memset(command, 0, sizeof(*command));
-    command->prp_aux = prp_aux;
-    command->count = count;
-    command->dma_flags = dma_flags;
-    command->first = first;
+    *command = (struct sptm_nvme_command){.prp_aux = prp_aux, .count = count, .dma_flags = dma_flags};
 
     memcpy((void *)sptm_nvme_tcb(qid, cid), template, sizeof(template));
     sysop("dsb sy");
@@ -101,15 +91,6 @@ static bool sptm_nvme_tl_idle(struct sptm_nvme_command *command, bool retry)
     return false;
 }
 
-static u64 sptm_nvme_command_target(const struct sptm_nvme_command *command, size_t index)
-{
-    if (!index)
-        return command->first;
-    if (command->count == 2)
-        return command->prp_aux;
-    return read64(command->prp_aux + (index - 1) * sizeof(u64));
-}
-
 static bool sptm_nvme_unmap_pages(struct exc_info *ctx)
 {
     u32 qid = ctx->regs[0];
@@ -134,10 +115,6 @@ static bool sptm_nvme_unmap_pages(struct exc_info *ctx)
         ctx->regs[0] = 0;
         return true;
     }
-
-    for (size_t index = 0; index < command->count; index++)
-        sptm_adjust_data_ref(sptm_nvme_command_target(command, index), command->dma_flags & BIT(0),
-                             -1);
 
     if (command->count > 2) {
         memset((void *)command->prp_aux, 0, SPTM_NVME_PRP_SLOT_SIZE);

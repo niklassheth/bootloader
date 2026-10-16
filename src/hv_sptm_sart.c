@@ -39,7 +39,6 @@ static bool sptm_sart_map(struct exc_info *ctx)
         return false;
     }
 
-    sptm_adjust_data_range(pa, size, permission != 0, 1);
     if (guard) {
         if (!sptm.sart_guarded_mask && sptm.sart_canary)
             write32(sptm.sart_canary, 0xabfedeed);
@@ -73,15 +72,12 @@ static bool sptm_sart_unmap(struct exc_info *ctx)
             break;
     }
 
-    bool writable = found_flags == 0xff;
     sptm.sart_guarded_mask &= ~BIT(found);
 
     write32(sptm.sart_base + found * sizeof(u32), 0);
     write32(sptm.sart_base + 0x80 + found * sizeof(u32), 0);
     write32(sptm.sart_base + 0x40 + found * sizeof(u32), 0);
     sysop("dsb sy");
-    sptm_adjust_data_range(pa, size, writable, -1);
-    sysop("dsb ishst");
     spin_unlock(&sptm.service_lock);
 
     ctx->regs[0] = SPTM_STATUS_SUCCESS;

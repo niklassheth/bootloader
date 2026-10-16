@@ -191,7 +191,8 @@ bool sptm_retype_frame(struct exc_info *ctx)
         mmu_map_ram_pages_nc(&host_page, 1, true);
     }
 
-    if (sptm_is_table_type(old_type))
+    // A table's valid-entry count starts and ends at zero.
+    if (sptm_is_table_type(old_type) || sptm_is_table_type(new_type))
         write16((u64)entry + 8, 0);
     entry[2] = new_type;
 
@@ -199,18 +200,12 @@ bool sptm_retype_frame(struct exc_info *ctx)
         // Zero IOMMU tables through their NC alias.
         memset((void *)sptm_iommu_table_va(pa), 0, SPTM_PAGE_SIZE);
         sysop("dsb sy");
-        write16((u64)entry + 4, 0);
     } else if (sptm_is_table_type(new_type)) {
         memset((void *)pa, 0, SPTM_PAGE_SIZE);
     }
-    if (sptm_is_table_type(new_type) || new_type == SPTM_FRAME_XNU_IOMMU) {
-        write16((u64)entry + 6, 0);
-        write16((u64)entry + 8, 0);
-
-        if (sptm_is_root_type(new_type)) {
-            write16((u64)entry + 10, (ctx->regs[3] >> 32) & 0xffff);
-            entry[12] = ctx->regs[3] & 0xff;
-        }
+    if (sptm_is_root_type(new_type)) {
+        write16((u64)entry + 10, (ctx->regs[3] >> 32) & 0xffff);
+        entry[12] = ctx->regs[3] & 0xff;
     }
 
     // Defer commpage policy changes until the shared region is configured.
@@ -281,10 +276,8 @@ bool sptm_map_page(struct exc_info *ctx)
         return true;
     }
 
-    if (!(old & 1) && (pte & 1)) {
-        sptm_adjust_mapping_ref(pte, geometry.descriptor_mask, 1);
+    if (!(old & 1) && (pte & 1))
         sptm_adjust_table_valid(slot, 1);
-    }
 
     ctx->regs[0] = old & 1 ? SPTM_STATUS_MAP_VALID : SPTM_STATUS_SUCCESS;
     write64(slot, pte);
@@ -321,7 +314,6 @@ bool sptm_map_table(struct exc_info *ctx)
 
     u64 child = tte & geometry.descriptor_mask;
     u64 attrs = tte & ~geometry.descriptor_mask;
-    sptm_adjust_parent_links(child, 1);
     for (size_t index = 0; index < geometry.page_ratio; index++) {
         u64 entry = slot + index * sizeof(u64);
         u64 replacement =
@@ -338,7 +330,6 @@ bool sptm_unmap_table(struct exc_info *ctx)
     struct sptm_geometry geometry;
     u64 slot = sptm_walk(ctx->regs[0], ctx->regs[1], ctx->regs[2], &geometry);
     slot &= ~(geometry.page_ratio * sizeof(u64) - 1);
-    sptm_adjust_parent_links(read64(slot) & geometry.descriptor_mask, -1);
     for (size_t index = 0; index < geometry.page_ratio; index++)
         write64(slot + index * sizeof(u64), 0);
     sptm_publish_stage1();
@@ -355,13 +346,12 @@ static void sptm_update_leaf(u64 slot, u64 template, u64 mask, u64 scratch)
 }
 
 // Clear a leaf if it is mapped, recording the displaced PTE in scratch.
-static void sptm_unmap_leaf(u64 slot, u64 descriptor_mask, u64 scratch, bool *changed)
+static void sptm_unmap_leaf(u64 slot, u64 scratch, bool *changed)
 {
     u64 old = slot ? read64(slot) : 0;
     write64(scratch, old);
     if (!(old & 1))
         return;
-    sptm_adjust_mapping_ref(old, descriptor_mask, -1);
     sptm_adjust_table_valid(slot, -1);
     write64(slot, 0);
     *changed = true;
@@ -515,7 +505,7 @@ bool sptm_unmap_region(struct exc_info *ctx)
     bool changed = false;
     for (size_t index = 0; index < count; index++)
         sptm_unmap_leaf(sptm_walk(root, start + index * page_size, 3, NULL),
-                        geometry.descriptor_mask, scratch + index * sizeof(u64), &changed);
+                        scratch + index * sizeof(u64), &changed);
 
     return sptm_finish_update(ctx, changed, changed && (options & BIT(8)));
 }
@@ -528,9 +518,8 @@ bool sptm_unmap_disjoint(struct exc_info *ctx)
     bool changed = false;
     for (size_t index = 0; index < count; index++) {
         u64 op = ops + index * 24;
-        struct sptm_geometry geometry;
-        u64 slot = sptm_walk(read64(op), read64(op + 8), 3, &geometry);
-        sptm_unmap_leaf(slot, geometry.descriptor_mask, scratch + index * sizeof(u64), &changed);
+        sptm_unmap_leaf(sptm_walk(read64(op), read64(op + 8), 3, NULL),
+                        scratch + index * sizeof(u64), &changed);
     }
 
     return sptm_finish_update(ctx, changed, false);

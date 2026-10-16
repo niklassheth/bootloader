@@ -260,8 +260,8 @@ static u16 sptm_boot_valid_count(u64 table)
     return count;
 }
 
-static void sptm_boot_set_frame(struct sptm_boot_context *context, u64 pa, u8 type, u32 ro, u32 wx,
-                                u8 level, u16 valid, u16 iommu_refs)
+static void sptm_boot_set_frame(struct sptm_boot_context *context, u64 pa, u8 type, u8 level,
+                                u16 valid)
 {
     u8 *entry = context->frame_table +
                 ((pa - context->managed_start) >> SPTM_PAGE_SHIFT) * SPTM_FRAME_ENTRY_SIZE;
@@ -269,12 +269,6 @@ static void sptm_boot_set_frame(struct sptm_boot_context *context, u64 pa, u8 ty
     if (sptm_is_table_type(type)) {
         entry[4] = level;
         write16((u64)entry + 8, valid);
-    } else if (type == SPTM_FRAME_XNU_IOMMU) {
-        write16((u64)entry + 4, iommu_refs);
-    } else {
-        if (ro)
-            write32((u64)entry + 8, ro);
-        write32((u64)entry + 12, wx);
     }
 }
 
@@ -322,7 +316,7 @@ static void sptm_boot_type_kernel_frames(struct sptm_boot_context *context)
                 size_t frame = (pa - context->managed_start) >> SPTM_PAGE_SHIFT;
                 if (priority > context->frame_priority[frame]) {
                     context->frame_priority[frame] = priority;
-                    sptm_boot_set_frame(context, pa, type, 1, 0, 0, 0, 0);
+                    sptm_boot_set_frame(context, pa, type, 0, 0);
                 }
             }
         }
@@ -507,18 +501,16 @@ u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text
     context.frame_priority =
         sptm_alloc_zero(&context.allocator, managed_pages, SPTM_CACHE_LINE_SIZE);
     sptm_boot_type_kernel_frames(&context);
-    // INIT_STATE never sees these objects; the root also owns its shared-L2 link.
-    sptm_boot_set_frame(&context, context.uat_global_root_pa, SPTM_FRAME_XNU_IOMMU, 0, 0, 0, 0, 2);
-    sptm_boot_set_frame(&context, context.uat_global_state_pa, SPTM_FRAME_XNU_IOMMU, 0, 0, 0, 0, 1);
+    // INIT_STATE never sees these objects.
+    sptm_boot_set_frame(&context, context.uat_global_root_pa, SPTM_FRAME_XNU_IOMMU, 0, 0);
+    sptm_boot_set_frame(&context, context.uat_global_state_pa, SPTM_FRAME_XNU_IOMMU, 0, 0);
     for (u32 index = 0; index < sptm_boot.page_count; index++) {
         const struct sptm_boot_pt_page *page = &sptm_boot.pages[index];
         u8 type = page->pa == context.ttbr1_pa   ? SPTM_FRAME_KERNEL_ROOT
                   : page->pa == context.ttbr0_pa ? SPTM_FRAME_USER_ROOT
                                                  : SPTM_FRAME_PAGE_TABLE;
-        sptm_boot_set_frame(&context, page->pa, type, 0, 0, page->level,
-                            sptm_boot_valid_count(page->pa), 0);
+        sptm_boot_set_frame(&context, page->pa, type, page->level, sptm_boot_valid_count(page->pa));
     }
-    sptm_boot_set_frame(&context, ttbr0_zero_page_pa, SPTM_FRAME_DEFAULT, 0, 1, 0, 0, 0);
 
     // libsptm interprets kind 2 as a table body and kind 5 as a data body.
     for (u32 type = 0; type < 256; type++)

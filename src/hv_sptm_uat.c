@@ -92,35 +92,6 @@ static void sptm_uat_write_descriptor(u64 slot, u64 descriptor)
     sysop("dsb oshst");
 }
 
-// UAT tables, and state objects, are pinned through the frame's IOMMU refcount.
-static void sptm_uat_ref_table(u64 pa, int delta)
-{
-    sptm_adjust_frame_u16(sptm_frame_entry(pa & SPTM_DESC_PA_MASK_16K), 4, delta);
-}
-
-// The firmware-owned shared L2 is not a UAT table frame and is never refcounted.
-static void sptm_uat_ref_parent(u64 pa, int delta)
-{
-    pa &= SPTM_DESC_PA_MASK_16K;
-    if (pa != sptm.uat_shared_l2_pa)
-        sptm_uat_ref_table(pa, delta);
-}
-
-static void sptm_uat_ref_page(u64 descriptor, int delta)
-{
-    // Track UAT leaves through the frame header's common in_use count.
-    sptm_adjust_iommu_use(descriptor & SPTM_DESC_PA_MASK_16K, delta);
-}
-
-// A state object pins itself and its roots; single-root states have a sentinel root1.
-static void sptm_uat_ref_state(u64 state_pa, u64 root0, u64 root1, int delta)
-{
-    sptm_uat_ref_table(state_pa, delta);
-    sptm_uat_ref_table(root0, delta);
-    if (!sptm_uat_sentinel(root1))
-        sptm_uat_ref_table(root1, delta);
-}
-
 static u64 sptm_uat_normalize_va(u64 va)
 {
     return va & (BIT(sptm.uat_va_width) - 1);
@@ -173,7 +144,6 @@ static bool sptm_uat_init_state(struct exc_info *ctx)
     u64 root1 = ctx->regs[2];
     bool dual = !sptm_uat_sentinel(root1);
 
-    sptm_uat_ref_state(state_pa, root0, root1, 1);
     memset((void *)state_pa, 0, SPTM_PAGE_SIZE);
     write8(state_pa, dual ? UAT_STATE_DUAL_ROOT : UAT_STATE_SINGLE_ROOT);
     write64(state_pa + UAT_STATE_ROOT0, root0);
@@ -187,9 +157,6 @@ static bool sptm_uat_init_state(struct exc_info *ctx)
 static bool sptm_uat_destroy_state(struct exc_info *ctx)
 {
     u64 state_pa = ctx->regs[0];
-    sptm_uat_ref_state(state_pa, read64(state_pa + UAT_STATE_ROOT0),
-                       read64(state_pa + UAT_STATE_ROOT1), -1);
-
     memset((void *)state_pa, 0, SPTM_PAGE_SIZE);
     write64(state_pa + UAT_STATE_ROOT0, UINT32_MAX);
     write64(state_pa + UAT_STATE_ROOT1, UINT32_MAX);
@@ -201,28 +168,16 @@ static bool sptm_uat_destroy_state(struct exc_info *ctx)
 
 static bool sptm_uat_map_table(struct exc_info *ctx)
 {
-    u64 state_pa = ctx->regs[0];
-    u64 slot = sptm_uat_slot(state_pa, ctx->regs[1], ctx->regs[2]);
-    u64 table_pa = ctx->regs[3] & SPTM_DESC_PA_MASK_16K;
-    u64 parent_pa = slot & ~(REGION_NORMAL_NC | SPTM_PAGE_MASK);
-
-    sptm_uat_ref_table(table_pa, 1);
-    sptm_uat_ref_parent(parent_pa, 1);
-    sptm_uat_write_descriptor(slot, table_pa | UAT_DESC_TABLE);
+    u64 slot = sptm_uat_slot(ctx->regs[0], ctx->regs[1], ctx->regs[2]);
+    sptm_uat_write_descriptor(slot, (ctx->regs[3] & SPTM_DESC_PA_MASK_16K) | UAT_DESC_TABLE);
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
 }
 
 static bool sptm_uat_unmap_table(struct exc_info *ctx)
 {
-    u64 slot = sptm_uat_slot(ctx->regs[0], ctx->regs[1], ctx->regs[2]);
-    u64 table_pa = read64(slot) & SPTM_DESC_PA_MASK_16K;
-    u64 parent_pa = slot & ~(REGION_NORMAL_NC | SPTM_PAGE_MASK);
-
-    sptm_uat_write_descriptor(slot, 0);
+    sptm_uat_write_descriptor(sptm_uat_slot(ctx->regs[0], ctx->regs[1], ctx->regs[2]), 0);
     sptm_uat_tlbi_all();
-    sptm_uat_ref_table(table_pa, -1);
-    sptm_uat_ref_parent(parent_pa, -1);
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
 }
@@ -276,19 +231,9 @@ static bool sptm_uat_map_continue(struct exc_info *ctx)
         u64 descriptor = sptm_uat_leaf_descriptor(state_pa, target, options);
         u64 old_descriptor = read64(slot);
         if (old_descriptor != descriptor) {
-            bool old_valid = old_descriptor & UAT_DESC_VALID;
-            bool changes_frame = !old_valid || (old_descriptor & SPTM_DESC_PA_MASK_16K) !=
-                                                   (descriptor & SPTM_DESC_PA_MASK_16K);
-            if (changes_frame)
-                sptm_uat_ref_page(descriptor, 1);
-
             sptm_uat_write_descriptor(slot, descriptor);
-            if (old_valid) {
-                // Keep the old target pinned until the replacement is invalidated.
+            if (old_descriptor & UAT_DESC_VALID)
                 sptm_uat_tlbi_all();
-                if (changes_frame)
-                    sptm_uat_ref_page(old_descriptor, -1);
-            }
         }
         va += SPTM_PAGE_SIZE;
         page_index++;
@@ -365,17 +310,10 @@ static bool sptm_uat_unmap_continue(struct exc_info *ctx)
     u64 segment_count = read64(state_pa + UAT_STATE_CURSOR0);
     u64 segment_index = read64(state_pa + UAT_STATE_CURSOR1);
     u64 page_index = read64(state_pa + UAT_STATE_CURSOR2);
-    u64 phase = read64(state_pa + UAT_STATE_CURSOR3);
     u32 budget = min(sptm.uat_mapping_limit, SPTM_UAT_BATCH_PAGES);
     bool cleared = false;
 
-    if (!segment_count) {
-        sptm_uat_publish_guard(state_pa, UAT_GUARD_IDLE);
-        ctx->regs[0] = 0;
-        return true;
-    }
-
-    // Clear VALID/TYPE while keeping the payload for handoff, then release the targets.
+    // Clear VALID/TYPE while keeping the payload for handoff.
     while (budget && segment_index < segment_count) {
         struct sptm_uat_segment *segment =
             (void *)(state_pa + UAT_STATE_UNMAP_SEGMENTS + segment_index * sizeof(*segment));
@@ -386,38 +324,22 @@ static bool sptm_uat_unmap_continue(struct exc_info *ctx)
         }
 
         u64 slot = sptm_uat_slot(state_pa, segment->first + page_index * SPTM_PAGE_SIZE, 3);
-        u64 descriptor = read64(slot);
-        if (phase == UAT_UNMAP_PHASE_CLEAR) {
-            sptm_uat_write_descriptor(slot, descriptor & ~3ULL);
-            cleared = true;
-        } else if (phase == UAT_UNMAP_PHASE_RELEASE) {
-            sptm_uat_ref_page(descriptor | 3, -1);
-        }
+        sptm_uat_write_descriptor(slot, read64(slot) & ~3ULL);
+        cleared = true;
         page_index++;
         budget--;
     }
 
-    // Invalidate each cleared chunk before releasing target references.
     if (cleared)
         sptm_uat_tlbi_all();
 
     write64(state_pa + UAT_STATE_CURSOR1, segment_index);
     write64(state_pa + UAT_STATE_CURSOR2, page_index);
-    if (segment_index < segment_count) {
-        sptm_uat_publish_guard(state_pa, UAT_GUARD_UNMAP);
-        ctx->regs[0] = 1;
-        return true;
-    }
-
-    if (phase == UAT_UNMAP_PHASE_RELEASE) {
-        sptm_uat_publish_guard(state_pa, UAT_GUARD_IDLE);
-        ctx->regs[0] = 0;
-        return true;
-    }
-
-    sptm_uat_handoff_complete(state_pa);
-    sptm_uat_begin(state_pa, UAT_GUARD_UNMAP, segment_count, 0, UAT_UNMAP_PHASE_RELEASE);
-    ctx->regs[0] = 1;
+    bool done = segment_index >= segment_count;
+    if (done)
+        sptm_uat_handoff_complete(state_pa);
+    sptm_uat_publish_guard(state_pa, done ? UAT_GUARD_IDLE : UAT_GUARD_UNMAP);
+    ctx->regs[0] = !done;
     return true;
 }
 
@@ -428,7 +350,7 @@ static bool sptm_uat_unmap_begin(struct exc_info *ctx)
 
     memcpy((void *)(state_pa + UAT_STATE_UNMAP_SEGMENTS), (void *)ctx->regs[1],
            segment_count * sizeof(struct sptm_uat_segment));
-    sptm_uat_begin(state_pa, UAT_GUARD_UNMAP, segment_count, 0, UAT_UNMAP_PHASE_CLEAR);
+    sptm_uat_begin(state_pa, UAT_GUARD_UNMAP, segment_count, 0, 0);
     return sptm_uat_unmap_continue(ctx);
 }
 

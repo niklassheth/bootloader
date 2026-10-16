@@ -119,9 +119,6 @@
 #define UAT_GUARD_PREPARE_UNMAP 4
 #define UAT_GUARD_UNMAP         5
 
-#define UAT_UNMAP_PHASE_CLEAR   0
-#define UAT_UNMAP_PHASE_RELEASE 1
-
 #define UAT_DESC_TABLE          3
 #define UAT_DESC_VALID          BIT(0)
 #define UAT_DESC_FIRMWARE_OWNED BIT(3)
@@ -293,7 +290,6 @@ struct sptm_surt_root {
 struct sptm_nvme_command {
     u64 prp_aux;
     u64 drained_slots;
-    u64 first;
     u16 count;
     u8 dma_flags;
 };
@@ -392,13 +388,7 @@ bool sptm_handle_dart(struct exc_info *ctx, u32 endpoint);
 bool sptm_is_table_type(u8 type);
 bool sptm_is_root_type(u8 type);
 u8 *sptm_frame_entry(u64 pa);
-void sptm_adjust_frame_u16(u8 *entry, size_t offset, int delta);
-void sptm_adjust_data_ref(u64 pa, bool writable, int delta);
-void sptm_adjust_data_range(u64 pa, u64 size, bool writable, int delta);
-void sptm_adjust_iommu_use(u64 pa, int delta);
 void sptm_adjust_table_valid(u64 slot, int delta);
-void sptm_adjust_parent_links(u64 child, int delta);
-void sptm_adjust_mapping_ref(u64 pte, u64 descriptor_mask, int delta);
 
 /* UAT */
 void sptm_uat_configure(u64 global_root_pa, u64 handoff_pa);
