@@ -224,7 +224,6 @@ struct sptm_dart {
     u16 sid_count;
     u16 sid_words;
     u8 instance_count;
-    bool valid;
     struct sptm_dart_sid *sid_states;
     const struct sptm_dart_dapf *dapf_entries;
     const u64 *clock_entries;
@@ -239,8 +238,7 @@ struct sptm_dart {
     u32 saved_counters[SPTM_MAX_DART_INSTANCES][9];
     u32 saved_tlimit[SPTM_MAX_DART_INSTANCES];
     u32 saved_teqreserve[SPTM_MAX_DART_INSTANCES];
-    u8 version_major;
-    u8 version_minor;
+    bool sid_exceptions;
     u8 counter_count;
     u16 interrupt_status_offset;
     bool hardware_flush_supported;
@@ -257,21 +255,6 @@ struct sptm_dart_sid {
     u32 tcr;
     u8 root_level;
     u8 flags;
-};
-
-struct sptm_dart_config {
-    u32 id;
-    u32 sid_count;
-    u32 instance_count;
-    u32 flags;
-    u64 instances[SPTM_MAX_DART_INSTANCES];
-    struct sptm_dart_sid *sid_states;
-    const struct sptm_dart_dapf *dapf_entries;
-    const u64 *clock_entries;
-    const struct sptm_dart_tunable *tunable_entries;
-    u32 dapf_count;
-    u32 clock_count;
-    u32 tunable_count;
 };
 
 struct sptm_dart_dapf {
@@ -416,12 +399,10 @@ struct sptm_cpu *sptm_register_cpu(u32 phys_id);
 u64 sptm_scratch_pa(struct exc_info *ctx);
 
 /* DART */
-struct sptm_dart *sptm_find_dart(u32 id);
 bool sptm_dart_flush_all(struct sptm_dart *dart);
 bool sptm_dart_power(struct exc_info *ctx, struct sptm_dart *dart, bool power_up);
 bool sptm_dart_init(struct exc_info *ctx, struct sptm_dart *dart);
 bool sptm_handle_dart(struct exc_info *ctx, u32 endpoint);
-void sptm_dart_configure(const struct sptm_dart_config *config);
 
 /* Frame ownership */
 bool sptm_is_table_type(u8 type);

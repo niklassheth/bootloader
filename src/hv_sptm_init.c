@@ -13,7 +13,6 @@
 
 struct sptm_init_instances {
     u64 base[SPTM_INIT_MAX_INSTANCES];
-    u64 size[SPTM_INIT_MAX_INSTANCES];
     u32 count;
 };
 
@@ -86,19 +85,17 @@ static void sptm_dart_instances(int node, int *path, struct sptm_init_instances 
             continue;
 
         assert(kind->count < ARRAY_SIZE(kind->base));
-        adt_get_reg(adt, path, "reg", index, &kind->base[kind->count], &kind->size[kind->count]);
-        kind->count++;
+        adt_get_reg(adt, path, "reg", index, &kind->base[kind->count++], NULL);
     }
 }
 
-static void sptm_dart_sid_states(int node, const char *name, struct sptm_dart_sid *states,
-                                 u32 sid_count)
+static void sptm_dart_sid_states(int node, const char *name, struct sptm_dart *dart)
 {
     u64 global_dva_size = sptm_adt_integer(node, "vm-size", 0);
     bool dynamic = sptm_adt_integer(node, "dart-options", 0) & 0x10;
 
-    for (u32 sid = 0; sid < sid_count; sid++) {
-        struct sptm_dart_sid *state = &states[sid];
+    for (u32 sid = 0; sid < dart->sid_count; sid++) {
+        struct sptm_dart_sid *state = &dart->sid_states[sid];
         char property[32];
         state->root_level = 1;
 
@@ -149,6 +146,14 @@ static void sptm_dart_sid_states(int node, const char *name, struct sptm_dart_si
             state->root_level = 1;
             state->flags = SPTM_DART_SID_KNOWN | SPTM_DART_SID_ENABLED | SPTM_DART_SID_EXCLAVE;
         }
+
+        // Firmware page tables bypass RETYPE, so retire their WB aliases here.
+        for (u64 page = state->pt_start; page < state->pt_end; page += SPTM_PAGE_SIZE) {
+            u64 host_page = page;
+            mmu_map_ram_pages_nc(&host_page, 1, true);
+        }
+        if (state->flags & SPTM_DART_SID_ENABLED)
+            dart->boot_streams[sid / 32] |= BIT(sid % 32);
     }
 }
 
@@ -267,30 +272,31 @@ static void sptm_init_darts(struct sptm_allocator *allocator)
         if (!trad.count || trad.count > SPTM_MAX_DART_INSTANCES)
             continue;
 
+        const char *name = adt_get_name(adt, node);
         u32 sid_count = sptm_adt_integer(node, "sid-count", 16);
-        struct sptm_dart_sid *states = sptm_alloc_zero(allocator, sid_count * sizeof(*states), 16);
+        if (sptm.dart_count >= ARRAY_SIZE(sptm.darts) || sid_count > SPTM_MAX_DART_SIDS) {
+            printf("HV: SPTM cannot track %s\n", name);
+            continue;
+        }
+
+        struct sptm_dart *dart = &sptm.darts[sptm.dart_count++];
         struct sptm_dart_dapf *dapf = sptm_alloc(allocator, SPTM_MAX_DART_DAPF * sizeof(*dapf), 16);
         struct sptm_dart_tunable *tunables =
             sptm_alloc(allocator, SPTM_MAX_DART_TUNABLES * sizeof(*tunables), 16);
         u64 *clocks = sptm_alloc(allocator, SPTM_MAX_DART_CLOCKS * sizeof(*clocks), 16);
-        const char *name = adt_get_name(adt, node);
-
-        sptm_dart_sid_states(node, name, states, sid_count);
-        struct sptm_dart_config config = {
-            .id = sptm_adt_integer(node, "dart-id", 0),
-            .sid_count = sid_count,
-            .instance_count = trad.count,
-            .flags = sptm_dart_flags(node, name),
-            .sid_states = states,
-            .dapf_entries = dapf,
-            .clock_entries = clocks,
-            .tunable_entries = tunables,
-            .dapf_count = sptm_dart_dapf(node, &fpad, dapf),
-            .clock_count = sptm_dart_clocks(node, &trad, &fpag, clocks),
-            .tunable_count = sptm_dart_tunables(node, &trad, tunables),
-        };
-        memcpy(config.instances, trad.base, sizeof(config.instances));
-        sptm_dart_configure(&config);
+        dart->id = sptm_adt_integer(node, "dart-id", 0);
+        dart->sid_count = sid_count;
+        dart->instance_count = trad.count;
+        memcpy(dart->instances, trad.base, sizeof(dart->instances));
+        dart->flags = sptm_dart_flags(node, name);
+        dart->dapf_entries = dapf;
+        dart->dapf_count = sptm_dart_dapf(node, &fpad, dapf);
+        dart->clock_entries = clocks;
+        dart->clock_count = sptm_dart_clocks(node, &trad, &fpag, clocks);
+        dart->tunable_entries = tunables;
+        dart->tunable_count = sptm_dart_tunables(node, &trad, tunables);
+        dart->sid_states = sptm_alloc_zero(allocator, sid_count * sizeof(*dart->sid_states), 16);
+        sptm_dart_sid_states(node, name, dart);
     }
 }
 

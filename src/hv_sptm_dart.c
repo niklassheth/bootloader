@@ -4,10 +4,10 @@
 
 static const u32 sptm_dart_shifts[] = {36, 25, SPTM_PAGE_SHIFT};
 
-struct sptm_dart *sptm_find_dart(u32 id)
+static struct sptm_dart *sptm_find_dart(u32 id)
 {
     for (size_t index = 0; index < sptm.dart_count; index++) {
-        if (sptm.darts[index].valid && sptm.darts[index].id == id)
+        if (sptm.darts[index].id == id)
             return &sptm.darts[index];
     }
 
@@ -308,73 +308,4 @@ bool sptm_handle_dart(struct exc_info *ctx, u32 endpoint)
     }
     spin_unlock(&sptm.service_lock);
     return handled;
-}
-
-void sptm_dart_configure(const struct sptm_dart_config *config)
-{
-    u32 id = config->id;
-    if (!config->sid_count || config->sid_count > SPTM_MAX_DART_SIDS) {
-        printf("HV: refusing invalid SPTM DART %u configuration\n", id);
-        return;
-    }
-
-    for (size_t index = 0; index < config->instance_count; index++) {
-        if (!config->instances[index] || (config->instances[index] & 3)) {
-            printf("HV: refusing invalid SPTM DART %u instance 0x%lx\n", id,
-                   config->instances[index]);
-            return;
-        }
-    }
-
-    struct sptm_dart *dart = sptm_find_dart(id);
-    if (!dart) {
-        if (sptm.dart_count >= ARRAY_SIZE(sptm.darts)) {
-            printf("HV: refusing excess SPTM DART %u\n", id);
-            return;
-        }
-        dart = &sptm.darts[sptm.dart_count++];
-    }
-
-    memset(dart, 0, sizeof(*dart));
-    dart->id = id;
-    dart->sid_count = config->sid_count;
-    dart->instance_count = config->instance_count;
-    dart->sid_states = config->sid_states;
-    dart->dapf_entries = config->dapf_entries;
-    dart->clock_entries = config->clock_entries;
-    dart->tunable_entries = config->tunable_entries;
-    dart->dapf_count = config->dapf_count;
-    dart->clock_count = config->clock_count;
-    dart->tunable_count = config->tunable_count;
-    dart->flags = config->flags;
-    for (u32 sid = 0; sid < dart->sid_count; sid++) {
-        struct sptm_dart_sid *state = &dart->sid_states[sid];
-        if (state->pt_start || state->pt_end) {
-            u64 size = state->pt_end - state->pt_start;
-            if ((state->pt_start & SPTM_PAGE_MASK) ||
-                (state->pt_end & SPTM_PAGE_MASK) || state->pt_end <= state->pt_start ||
-                !sptm_valid_platform_pa(state->pt_start, size) ||
-                (state->pt_start < sptm.managed_end &&
-                 sptm.managed_start < state->pt_end) ||
-                (state->root &&
-                 (state->root < state->pt_start || state->root >= state->pt_end))) {
-                printf("HV: refusing invalid SPTM DART %u SID %u page-table region "
-                       "0x%lx..0x%lx root=0x%lx\n",
-                       id, sid, state->pt_start, state->pt_end, state->root);
-                memset(dart, 0, sizeof(*dart));
-                return;
-            }
-
-            // Firmware tables bypass RETYPE, so retire their WB aliases here.
-            for (u64 page = state->pt_start; page < state->pt_end;
-                 page += SPTM_PAGE_SIZE) {
-                u64 host_page = page;
-                mmu_map_ram_pages_nc(&host_page, 1, true);
-            }
-        }
-        if (state->flags & SPTM_DART_SID_ENABLED)
-            dart->boot_streams[sid / 32] |= BIT(sid % 32);
-    }
-    dart->valid = true;
-    memcpy(dart->instances, config->instances, sizeof(dart->instances));
 }

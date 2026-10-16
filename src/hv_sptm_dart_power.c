@@ -11,7 +11,7 @@ static bool sptm_dart_clear_errors(const struct sptm_dart *dart)
     for (size_t index = 0; index < dart->instance_count; index++) {
         u64 base = dart->instances[index];
 
-        if (dart->version_major > 2 || (dart->version_major == 2 && dart->version_minor >= 2)) {
+        if (dart->sid_exceptions) {
             // DART 2.2 uses write-one-to-clear per-SID exception words.
             for (size_t word = 0; word < dart->sid_words; word++) {
                 u64 address = base + DART_SID_EXCEPTIONS + word * sizeof(u32);
@@ -165,18 +165,8 @@ static void sptm_dart_write_sized(u64 address, u32 size, u64 value)
 
 static bool sptm_dart_apply_tunables(const struct sptm_dart *dart)
 {
-    if (!dart->tunable_count)
-        return true;
     for (size_t index = 0; index < dart->tunable_count; index++) {
-        // Bases come from this DART's instances; sizes and offsets come from the ADT.
         const struct sptm_dart_tunable *entry = &dart->tunable_entries[index];
-        if ((entry->size != 1 && entry->size != 2 && entry->size != 4 && entry->size != 8) ||
-            (entry->offset & (entry->size - 1)) || entry->offset > 0x10000 - entry->size)
-            return false;
-        u64 width_mask = entry->size == 8 ? UINT64_MAX : BIT(entry->size * 8) - 1;
-        if ((entry->mask | entry->value) & ~width_mask)
-            return false;
-
         u64 address = entry->base + entry->offset;
         u64 wanted = entry->value & entry->mask;
         u64 current = sptm_dart_read_sized(address, entry->size);
@@ -192,8 +182,6 @@ static bool sptm_dart_apply_tunables(const struct sptm_dart *dart)
 
 static void sptm_dart_program_dapf(const struct sptm_dart *dart)
 {
-    if (!dart->dapf_count)
-        return;
     for (size_t index = 0; index < dart->dapf_count; index++) {
         const struct sptm_dart_dapf *entry = &dart->dapf_entries[index];
         write32(entry->base + 0x04, entry->r4);
@@ -249,46 +237,24 @@ static bool sptm_dart_program_sids(struct sptm_dart *dart)
     return sptm_dart_flush_all(dart);
 }
 
+// All instances of one DART share a version and SID capacity.
 static bool sptm_dart_discover(struct sptm_dart *dart)
 {
-    u8 version_major = 0, version_minor = 0, pa_width = 0;
-    u16 sid_capacity = 0;
-    bool hardware_flush_supported = true;
+    u32 params_8 = read32(dart->instances[0] + DART_PARAMS_8);
+    u32 params_c = read32(dart->instances[0] + DART_PARAMS_C);
+    if (params_8 == DART_UNAVAILABLE || params_8 == UINT32_MAX)
+        return false;
 
-    for (size_t index = 0; index < dart->instance_count; index++) {
-        u64 base = dart->instances[index];
-        u32 params_4 = read32(base + DART_PARAMS_4);
-        u32 params_8 = read32(base + DART_PARAMS_8);
-        u32 params_c = read32(base + DART_PARAMS_C);
-        if (params_4 == DART_UNAVAILABLE || params_8 == DART_UNAVAILABLE ||
-            params_c == DART_UNAVAILABLE || params_4 == UINT32_MAX || params_8 == UINT32_MAX ||
-            params_c == UINT32_MAX)
-            return false;
-
-        u8 current_major = (params_8 >> 8) & 0xff;
-        u8 current_minor = params_8 & 0xff;
-        u8 current_pa_width = (params_8 >> 24) & 0x3f;
-        u16 current_sid_capacity = params_c & 0x1ff;
-        if (!current_major || !current_pa_width || !current_sid_capacity ||
-            current_sid_capacity < dart->sid_count)
-            return false;
-        if (index && (current_major != version_major || current_minor != version_minor ||
-                      current_pa_width != pa_width || current_sid_capacity != sid_capacity))
-            return false;
-        version_major = current_major;
-        version_minor = current_minor;
-        pa_width = current_pa_width;
-        sid_capacity = current_sid_capacity;
-        hardware_flush_supported = hardware_flush_supported && (params_4 & BIT(3));
-    }
-
-    dart->version_major = version_major;
-    dart->version_minor = version_minor;
-    dart->hardware_flush_supported = hardware_flush_supported;
-    dart->sid_words = (sid_capacity + 31) / 32;
-    dart->counter_count = version_major >= 2 ? 9 : 6;
-    dart->interrupt_status_offset =
-        version_major > 2 || (version_major == 2 && version_minor >= 2) ? 0x164 : 0x160;
+    u8 major = (params_8 >> 8) & 0xff;
+    u8 minor = params_8 & 0xff;
+    dart->sid_exceptions = major > 2 || (major == 2 && minor >= 2);
+    dart->sid_words = ((params_c & 0x1ff) + 31) / 32;
+    dart->counter_count = major >= 2 ? 9 : 6;
+    dart->interrupt_status_offset = dart->sid_exceptions ? 0x164 : 0x160;
+    dart->hardware_flush_supported = true;
+    for (size_t index = 0; index < dart->instance_count; index++)
+        dart->hardware_flush_supported &=
+            !!(read32(dart->instances[index] + DART_PARAMS_4) & BIT(3));
     return true;
 }
 
