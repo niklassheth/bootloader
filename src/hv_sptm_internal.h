@@ -364,8 +364,6 @@ struct sptm_state {
     struct sptm_cpu cpus[MAX_CPUS];
     u32 hv_phys_ids[MAX_CPUS];
     u8 cpu_count;
-    u64 sprr_perm[2];
-    u32 sprr_umprr;
     u8 max_cpus;
     u64 commpage_rw[SPTM_MAX_COMMPAGE_RW];
     u8 commpage_rw_count;

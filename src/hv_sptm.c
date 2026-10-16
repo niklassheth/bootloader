@@ -80,20 +80,11 @@ static bool sptm_handle_shadow_hvc(struct exc_info *ctx, u32 immediate)
 
     if (immediate >= 0x1c0 && immediate < 0x280) {
         u32 operation = (immediate - 0x1c0) >> 5;
-        bool is_write = operation & 1;
-        u32 reg = operation >> 1;
-
-        if (reg < 2) {
-            if (is_write)
-                sptm.sprr_perm[reg] = value;
-            else if (rt != 31)
-                ctx->regs[rt] = sptm.sprr_perm[reg];
-        } else {
-            if (is_write)
-                sptm.sprr_umprr = value;
-            else if (rt != 31)
-                ctx->regs[rt] = sptm.sprr_umprr;
-        }
+        u64 *shadow = hv_sprr_shadow(operation >> 1);
+        if (operation & 1)
+            *shadow = value;
+        else if (rt != 31)
+            ctx->regs[rt] = *shadow;
         return true;
     }
 

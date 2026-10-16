@@ -649,8 +649,6 @@ u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text
     sptm.frame_table_pa = context.frame_table_pa;
     sptm.panic_state_pa = context.panic_state_pa;
     sptm.txm_info_va = context.txm_info_va;
-    sptm.sprr_perm[0] = 0x2010002030100000;
-    sptm.sprr_perm[1] = 0x2020a506f020f0e0;
     sptm.enabled = true;
 
     sptm.uat_global_state = context.uat_global_state_pa;

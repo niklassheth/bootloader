@@ -86,6 +86,7 @@ void virtio_put_buffer(u64 base, int qu, u32 id, u32 len);
 /* Exceptions */
 void hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type, void *extra);
 bool hv_handle_pmc_hvc(struct exc_info *ctx, u32 immediate);
+u64 *hv_sprr_shadow(u32 index);
 bool hv_handle_objc_bp_hvc(struct exc_info *ctx, u32 immediate);
 void hv_set_time_stealing(bool enabled, bool reset);
 void hv_apply_time_stealing_offset(void);

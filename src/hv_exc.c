@@ -80,6 +80,13 @@ static u64 hv_sprr_perm_el0 = 0x2010002030100000;
 static u64 hv_sprr_perm_el1 = 0x2020a506f020f0e0;
 static u64 hv_sprr_umprr_el1;
 
+// SPTM guests reach the same shadows through hypercalls: PERM_EL0, PERM_EL1, then UMPRR_EL1.
+u64 *hv_sprr_shadow(u32 index)
+{
+    u64 *const shadows[] = {&hv_sprr_perm_el0, &hv_sprr_perm_el1, &hv_sprr_umprr_el1};
+    return shadows[index];
+}
+
 #define APPLE_CNTV_FREQ 24000000ULL
 
 /*
