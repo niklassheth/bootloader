@@ -180,7 +180,6 @@
 #define SPTM_FRAME_COMMPAGE_PT             23
 #define SPTM_FRAME_STAGE2_ROOT             33
 #define SPTM_FRAME_STAGE2_PT               34
-#define SPTM_FRAME_KERNEL_RESTRICTED       35
 #define SPTM_FRAME_SUBPAGE                 40
 #define SPTM_FRAME_DEFAULT                 11
 #define SPTM_FRAME_RO                      12
@@ -410,6 +409,7 @@ void sptm_init_platform(struct sptm_allocator *allocator);
 bool sptm_is_managed_range(u64 pa, size_t size);
 bool sptm_valid_platform_pa(u64 pa, size_t size);
 u64 sptm_pointer_pa(u64 pointer);
+u64 sptm_physmap_va(u64 pa);
 u64 sptm_iommu_table_va(u64 pa);
 struct sptm_cpu *sptm_find_cpu(u32 phys_id);
 struct sptm_cpu *sptm_register_cpu(u32 phys_id);
@@ -428,6 +428,7 @@ bool sptm_is_table_type(u8 type);
 bool sptm_is_root_type(u8 type);
 u8 *sptm_frame_entry(u64 pa);
 u32 *sptm_external_ref_entry(u64 pa);
+bool sptm_adjust_frame_u16(u8 *entry, size_t offset, int delta);
 bool sptm_adjust_data_ref(u64 pa, bool writable, int delta);
 bool sptm_adjust_data_range(u64 pa, u64 size, bool writable, int delta);
 bool sptm_adjust_iommu_use(u64 pa, int delta);

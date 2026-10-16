@@ -37,6 +37,11 @@ u64 sptm_pointer_pa(u64 pointer)
     return pointer;
 }
 
+u64 sptm_physmap_va(u64 pa)
+{
+    return sptm.physmap_base + pa - sptm.managed_start;
+}
+
 u64 sptm_iommu_table_va(u64 pa)
 {
     return pa | REGION_NORMAL_NC;

@@ -53,11 +53,8 @@ u32 *sptm_external_ref_entry(u64 pa)
     return (u32 *)(sptm.external_ref_table_pa + index * (2 * sizeof(u32)));
 }
 
-static bool sptm_adjust_frame_u16(u8 *entry, size_t offset, int delta)
+bool sptm_adjust_frame_u16(u8 *entry, size_t offset, int delta)
 {
-    if (!entry)
-        return false;
-
     spin_lock(&sptm.frame_lock);
     u16 value = read16((u64)entry + offset);
     if ((delta < 0 && value < (u16)-delta) || (delta > 0 && value > UINT16_MAX - (u16)delta)) {
@@ -76,14 +73,7 @@ bool sptm_adjust_data_ref(u64 pa, bool writable, int delta)
         return true; /* MMIO and unmanaged carveouts have no frame entry. */
     u32 *external = sptm_external_ref_entry(pa & ~SPTM_PAGE_MASK);
 
-    // Data refcounts are only valid in ordinary frame bodies.
     spin_lock(&sptm.frame_lock);
-    if (sptm_is_table_type(entry[2]) || entry[2] == SPTM_FRAME_XNU_IOMMU ||
-        (delta > 0 && entry[2] == SPTM_FRAME_KERNEL_RESTRICTED)) {
-        spin_unlock(&sptm.frame_lock);
-        return false;
-    }
-
     size_t offset = writable ? 12 : 8;
     size_t external_index = writable ? 1 : 0;
     u32 value = read32((u64)entry + offset);
@@ -120,26 +110,17 @@ bool sptm_adjust_iommu_use(u64 pa, int delta)
     u8 *entry = sptm_frame_entry(pa & ~SPTM_PAGE_MASK);
     if (!entry)
         return true; /* MMIO and unmanaged carveouts have no frame entry. */
-
-    if (delta > 0 && entry[2] == SPTM_FRAME_KERNEL_RESTRICTED)
-        return false;
     return sptm_adjust_frame_u16(entry, 0, delta);
 }
 
 bool sptm_adjust_table_valid(u64 slot, int delta)
 {
-    u8 *entry = sptm_frame_entry(slot & ~SPTM_PAGE_MASK);
-    if (!entry || !sptm_is_table_type(entry[2]))
-        return false;
-    return sptm_adjust_frame_u16(entry, 8, delta);
+    return sptm_adjust_frame_u16(sptm_frame_entry(slot & ~SPTM_PAGE_MASK), 8, delta);
 }
 
 bool sptm_adjust_parent_links(u64 child, int delta)
 {
-    u8 *entry = sptm_frame_entry(child & ~SPTM_PAGE_MASK);
-    if (!entry || !sptm_is_table_type(entry[2]))
-        return false;
-    return sptm_adjust_frame_u16(entry, 6, delta);
+    return sptm_adjust_frame_u16(sptm_frame_entry(child & ~SPTM_PAGE_MASK), 6, delta);
 }
 
 bool sptm_adjust_mapping_ref(u64 pte, u64 descriptor_mask, int delta)

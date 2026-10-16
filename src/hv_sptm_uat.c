@@ -84,18 +84,10 @@ static void sptm_uat_write_descriptor(u64 slot, u64 descriptor)
     sysop("dsb oshst");
 }
 
+// UAT tables, and state objects, are pinned through the frame's IOMMU refcount.
 static bool sptm_uat_ref_table(u64 pa, int delta)
 {
-    pa &= SPTM_DESC_PA_MASK_16K;
-    u8 *entry = sptm_frame_entry(pa);
-    if (!entry || entry[2] != SPTM_FRAME_XNU_IOMMU)
-        return false;
-
-    u16 refcount = read16((u64)entry + 4);
-    if ((delta < 0 && refcount < (u16)-delta) || (delta > 0 && refcount > UINT16_MAX - (u16)delta))
-        return false;
-    write16((u64)entry + 4, refcount + delta);
-    return true;
+    return sptm_adjust_frame_u16(sptm_frame_entry(pa & SPTM_DESC_PA_MASK_16K), 4, delta);
 }
 
 // The firmware-owned shared L2 is not a UAT table frame and is never refcounted.
@@ -263,8 +255,9 @@ static u64 sptm_uat_leaf_descriptor(u64 state_pa, u64 target, u32 options)
     return (target & SPTM_DESC_PA_MASK_16K) | flags;
 }
 
-static bool sptm_uat_map_continue(struct exc_info *ctx, u64 state_pa)
+static bool sptm_uat_map_continue(struct exc_info *ctx)
 {
+    u64 state_pa = ctx->regs[0];
     u64 va = read64(state_pa + UAT_STATE_CURSOR0);
     u64 segment_count = read64(state_pa + UAT_STATE_CURSOR1);
     u64 segment_index = read64(state_pa + UAT_STATE_CURSOR2);
@@ -328,11 +321,12 @@ static bool sptm_uat_map_begin(struct exc_info *ctx)
     write32(state_pa + UAT_STATE_OPTIONS, ctx->regs[4]);
     write8(state_pa + UAT_STATE_FLUSH_LEVEL, 0);
     sptm_uat_publish_guard(state_pa, UAT_GUARD_MAP);
-    return sptm_uat_map_continue(ctx, state_pa);
+    return sptm_uat_map_continue(ctx);
 }
 
-static bool sptm_uat_prepare_unmap_continue(struct exc_info *ctx, u64 state_pa)
+static bool sptm_uat_prepare_unmap_continue(struct exc_info *ctx)
 {
+    u64 state_pa = ctx->regs[0];
     u64 va = read64(state_pa + UAT_STATE_CURSOR0);
     u64 count = read64(state_pa + UAT_STATE_CURSOR1);
     u64 processed = read64(state_pa + UAT_STATE_CURSOR2);
@@ -374,11 +368,12 @@ static bool sptm_uat_prepare_unmap_begin(struct exc_info *ctx)
     write64(state_pa + UAT_STATE_CURSOR3,
             count ? sptm_uat_handoff_slot_for_state(state_pa) + 1 : 0);
     sptm_uat_publish_guard(state_pa, UAT_GUARD_PREPARE_UNMAP);
-    return sptm_uat_prepare_unmap_continue(ctx, state_pa);
+    return sptm_uat_prepare_unmap_continue(ctx);
 }
 
-static bool sptm_uat_unmap_continue(struct exc_info *ctx, u64 state_pa)
+static bool sptm_uat_unmap_continue(struct exc_info *ctx)
 {
+    u64 state_pa = ctx->regs[0];
     u64 segment_count = read64(state_pa + UAT_STATE_CURSOR0);
     u64 segment_index = read64(state_pa + UAT_STATE_CURSOR1);
     u64 page_index = read64(state_pa + UAT_STATE_CURSOR2);
@@ -455,7 +450,7 @@ static bool sptm_uat_unmap_begin(struct exc_info *ctx)
     write64(state_pa + UAT_STATE_CURSOR3, UAT_UNMAP_PHASE_VALIDATE);
     write64(state_pa + UAT_STATE_UNMAP_FLUSH_COUNT, 0);
     sptm_uat_publish_guard(state_pa, UAT_GUARD_UNMAP);
-    return sptm_uat_unmap_continue(ctx, state_pa);
+    return sptm_uat_unmap_continue(ctx);
 }
 
 static u64 sptm_uat_ttbr(u64 root, u16 context_id)
@@ -507,94 +502,45 @@ static bool sptm_uat_remove_context(struct exc_info *ctx)
 
 static bool sptm_uat_get_info(struct exc_info *ctx)
 {
-    u64 value = UINT64_MAX;
-    switch (ctx->regs[0]) {
-        case 0:
-            value = sptm.uat_mode;
-            break;
-        case 1:
-            if (sptm.uat_mode == 0)
-                value = sptm.uat_global_state;
-            break;
-        case 2:
-            if (sptm.uat_mode == 1)
-                value = sptm.uat_global_state;
-            break;
-        case 3:
-            value = sptm.uat_va_width - 1;
-            break;
-        case 4:
-            // Return the L1 bits in their original VA positions.
-            value = (BIT(max((int)sptm.uat_va_width - 37, 0)) - 1) << 36;
-            break;
-        case 5:
-            value = sptm.uat_segment_limit;
-            break;
-        case 6:
-            value = 0;
-            break;
-        case 7:
-            value = BIT(sptm.uat_va_width);
-            break;
-        case 8:
-            value = sptm.uat_state_size;
-            break;
-        case 9:
-            value = sptm.uat_shared_l2_va;
-            break;
-    }
-    ctx->regs[0] = value;
+    const u64 values[] = {
+        sptm.uat_mode,
+        sptm.uat_mode == 0 ? sptm.uat_global_state : UINT64_MAX,
+        sptm.uat_mode == 1 ? sptm.uat_global_state : UINT64_MAX,
+        sptm.uat_va_width - 1,
+        // The L1 bits, in their original VA positions.
+        (BIT(max((int)sptm.uat_va_width - 37, 0)) - 1) << 36,
+        sptm.uat_segment_limit,
+        0,
+        BIT(sptm.uat_va_width),
+        sptm.uat_state_size,
+        sptm.uat_shared_l2_va,
+    };
+    ctx->regs[0] = ctx->regs[0] < ARRAY_SIZE(values) ? values[ctx->regs[0]] : UINT64_MAX;
     return true;
 }
 
 bool sptm_handle_uat(struct exc_info *ctx, u32 endpoint)
 {
-    if (!sptm.uat_configured)
+    static bool (*const handlers[])(struct exc_info *) = {
+        sptm_uat_init_state,
+        sptm_uat_destroy_state,
+        sptm_uat_map_table,
+        sptm_uat_unmap_table,
+        sptm_uat_map_begin,
+        sptm_uat_map_continue,
+        sptm_uat_prepare_unmap_begin,
+        sptm_uat_prepare_unmap_continue,
+        sptm_uat_unmap_begin,
+        sptm_uat_unmap_continue,
+        sptm_uat_set_context,
+        sptm_uat_remove_context,
+        sptm_uat_get_info,
+    };
+    if (!sptm.uat_configured || endpoint >= ARRAY_SIZE(handlers))
         return false;
 
-    bool handled = false;
     spin_lock(&sptm.service_lock);
-    switch (endpoint) {
-        case 0:
-            handled = sptm_uat_init_state(ctx);
-            break;
-        case 1:
-            handled = sptm_uat_destroy_state(ctx);
-            break;
-        case 2:
-            handled = sptm_uat_map_table(ctx);
-            break;
-        case 3:
-            handled = sptm_uat_unmap_table(ctx);
-            break;
-        case 4:
-            handled = sptm_uat_map_begin(ctx);
-            break;
-        case 5:
-            handled = sptm_uat_map_continue(ctx, ctx->regs[0]);
-            break;
-        case 6:
-            handled = sptm_uat_prepare_unmap_begin(ctx);
-            break;
-        case 7:
-            handled = sptm_uat_prepare_unmap_continue(ctx, ctx->regs[0]);
-            break;
-        case 8:
-            handled = sptm_uat_unmap_begin(ctx);
-            break;
-        case 9:
-            handled = sptm_uat_unmap_continue(ctx, ctx->regs[0]);
-            break;
-        case 10:
-            handled = sptm_uat_set_context(ctx);
-            break;
-        case 11:
-            handled = sptm_uat_remove_context(ctx);
-            break;
-        case 12:
-            handled = sptm_uat_get_info(ctx);
-            break;
-    }
+    bool handled = handlers[endpoint](ctx);
     spin_unlock(&sptm.service_lock);
     return handled;
 }

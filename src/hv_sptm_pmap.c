@@ -197,27 +197,12 @@ bool sptm_retype_frame(struct exc_info *ctx)
     u64 physmap_replacement = 0;
 
     if (iommu_transition) {
-        u64 physmap_va = sptm.physmap_base + pa - sptm.managed_start;
-        physmap_slot = sptm_walk(sptm.kernel_root, physmap_va, 3, NULL);
-        u64 descriptor = physmap_slot ? read64(physmap_slot) : 0;
-        u64 type_mask = (7ULL << 2) | (3ULL << 8);
-        u64 expected = entering_iommu ? PTE_MAIR_IDX(MAIR_IDX_NORMAL) | PTE_SH_OS
-                                     : PTE_MAIR_IDX(MAIR_IDX_NORMAL_NC) | PTE_SH_NS;
-        u64 replacement = entering_iommu ? PTE_MAIR_IDX(MAIR_IDX_NORMAL_NC) | PTE_SH_NS
-                                         : PTE_MAIR_IDX(MAIR_IDX_NORMAL) | PTE_SH_OS;
-
-        if (!physmap_slot || !(descriptor & 1) ||
-            (descriptor & SPTM_DESC_PA_MASK_16K) != pa ||
-            (descriptor & type_mask) != expected) {
-            printf("HV: SPTM refusing IOMMU RETYPE with unexpected physmap alias "
-                   "pa=0x%lx descriptor=0x%lx expected-type=0x%lx\n",
-                   pa, descriptor, expected);
-            spin_unlock(&sptm.frame_lock);
-            return false;
-        }
-        physmap_replacement = (descriptor & ~type_mask) | replacement;
-
         // Keep the physmap leaf invalid during the host memory-type transition.
+        u64 type_mask = (7ULL << 2) | (3ULL << 8);
+        u64 type = entering_iommu ? PTE_MAIR_IDX(MAIR_IDX_NORMAL_NC) | PTE_SH_NS
+                                  : PTE_MAIR_IDX(MAIR_IDX_NORMAL) | PTE_SH_OS;
+        physmap_slot = sptm_walk(sptm.kernel_root, sptm_physmap_va(pa), 3, NULL);
+        physmap_replacement = (read64(physmap_slot) & ~type_mask) | type;
         write64(physmap_slot, 0);
         sptm_flush_stage1_tlb();
     }
@@ -311,7 +296,7 @@ bool sptm_map_page(struct exc_info *ctx)
     u64 old = read64(slot);
     u64 scratch = sptm_scratch_pa(ctx);
     write64(scratch, old);
-    write64(scratch + sizeof(u64), sptm.physmap_base + slot - sptm.managed_start);
+    write64(scratch + sizeof(u64), sptm_physmap_va(slot));
 
     if ((old & 1) && ((old & geometry.descriptor_mask) != (pte & geometry.descriptor_mask))) {
         sysop("dsb sy");
@@ -392,6 +377,32 @@ bool sptm_unmap_table(struct exc_info *ctx)
     return true;
 }
 
+// Merge a template into a leaf, recording the displaced PTE in scratch.
+static void sptm_update_leaf(u64 slot, u64 template, u64 mask, u64 scratch)
+{
+    u64 old = read64(slot);
+    write64(scratch, old);
+    write64(slot, (old & ~mask) | (template & mask));
+}
+
+// Clear a leaf if it is mapped, recording the displaced PTE in scratch.
+static bool sptm_unmap_leaf(u64 slot, u64 descriptor_mask, u64 scratch, bool *changed)
+{
+    u64 old = slot ? read64(slot) : 0;
+    write64(scratch, old);
+    if (!(old & 1))
+        return true;
+    if (!sptm_adjust_mapping_ref(old, descriptor_mask, -1))
+        return false;
+    if (!sptm_adjust_table_valid(slot, -1)) {
+        sptm_adjust_mapping_ref(old, descriptor_mask, 1);
+        return false;
+    }
+    write64(slot, 0);
+    *changed = true;
+    return true;
+}
+
 static u64 sptm_update_mask(u64 flags)
 {
     u64 mask = 0;
@@ -427,13 +438,10 @@ bool sptm_update_region(struct exc_info *ctx)
     u64 templates = sptm_pointer_pa(ctx->regs[3]);
     u64 scratch = sptm_scratch_pa(ctx);
     u64 mask = sptm_update_mask(flags);
-    for (size_t index = 0; index < count; index++) {
-        u64 slot = sptm_walk(root, start + index * page_size, 3, NULL);
-        u64 old = read64(slot);
-        u64 template = read64(templates + index * sizeof(u64));
-        write64(scratch + index * sizeof(u64), old);
-        write64(slot, (old & ~mask) | (template & mask));
-    }
+    for (size_t index = 0; index < count; index++)
+        sptm_update_leaf(sptm_walk(root, start + index * page_size, 3, NULL),
+                         read64(templates + index * sizeof(u64)), mask,
+                         scratch + index * sizeof(u64));
 
     // Do not invalidate a partial deferred alias batch.
     return sptm_finish_update(ctx, count, flags & BIT(8));
@@ -449,11 +457,8 @@ bool sptm_update_disjoint(struct exc_info *ctx)
     u64 mask = sptm_update_mask(flags);
     for (size_t index = 0; index < count; index++) {
         u64 op = ops + index * 24;
-        u64 slot = sptm_walk(read64(op), read64(op + 8), 3, NULL);
-        u64 old = read64(slot);
-        u64 template = read64(op + 16);
-        write64(scratch + index * sizeof(u64), old);
-        write64(slot, (old & ~mask) | (template & mask));
+        sptm_update_leaf(sptm_walk(read64(op), read64(op + 8), 3, NULL), read64(op + 16), mask,
+                         scratch + index * sizeof(u64));
     }
 
     return sptm_finish_update(ctx, count, flags & BIT(8));
@@ -467,66 +472,30 @@ bool sptm_update_disjoint_multipage(struct exc_info *ctx)
     size_t used;
 
     if (!cpu_features->apple_sysregs_unlocked) {
-        const u64 restore_tag = BIT(63);
-        size_t page_count = 0;
-
-        // Mirror RT/WCOMB memory types in m1n1, restoring WB only after TLBI.
-        // SKIP_PAPT continuations reuse the per-CPU scratch page.
-        used = 0;
-        while (used < slots) {
+        // Mirror RT/WCOMB memory types in m1n1, restoring WB only after TLBI. The
+        // last transition of each page in the stream wins.
+        u64 *protect = (u64 *)scratch;
+        size_t protect_count = 0;
+        for (used = 0; used < slots; used += 1 + read32(stream + used * 24 + 16)) {
             u64 header = stream + used * 24;
             u64 paddr = read64(header);
-            u64 papt_template = read64(header + 8);
-            size_t inner_count = read32(header + 16);
-            u64 options = read32(header + 20);
-
-            if (!(options & BIT(9)) && sptm_is_managed_range(paddr, 1)) {
-                u64 tagged = paddr;
-                if ((papt_template & (7ULL << 2)) != PTE_MAIR_IDX(1))
-                    tagged |= restore_tag;
-
-                size_t index = 0;
-                for (; index < page_count; index++) {
-                    if ((read64(scratch + index * sizeof(u64)) & ~restore_tag) == paddr) {
-                        /* Last transition in the stream wins. */
-                        write64(scratch + index * sizeof(u64), tagged);
-                        break;
-                    }
-                }
-                if (index == page_count)
-                    write64(scratch + page_count++ * sizeof(u64), tagged);
-            }
-
-            used += 1 + inner_count;
-        }
-
-        /* Partition in place: protections first, queued restorations second. */
-        size_t protect_count = 0;
-        for (size_t index = 0; index < page_count; index++) {
-            u64 value = read64(scratch + index * sizeof(u64));
-            if (value & restore_tag)
+            if ((read32(header + 20) & BIT(9)) || !sptm_is_managed_range(paddr, 1))
                 continue;
 
-            if (index != protect_count) {
-                u64 other = read64(scratch + protect_count * sizeof(u64));
-                write64(scratch + index * sizeof(u64), other);
-                write64(scratch + protect_count * sizeof(u64), value);
+            for (size_t index = 0; index < protect_count; index++) {
+                if (protect[index] == paddr) {
+                    protect[index] = protect[--protect_count];
+                    break;
+                }
             }
-            protect_count++;
+            if ((read64(header + 8) & (7ULL << 2)) == PTE_MAIR_IDX(1)) {
+                sptm_cancel_host_rt_restore(paddr);
+                protect[protect_count++] = paddr;
+            } else {
+                sptm_queue_host_rt_restore(paddr);
+            }
         }
-
-        for (size_t index = 0; index < protect_count; index++)
-            sptm_cancel_host_rt_restore(read64(scratch + index * sizeof(u64)));
-
-        if (protect_count)
-            mmu_map_ram_pages_nc((u64 *)scratch, protect_count, false);
-
-        size_t restore_count = page_count - protect_count;
-        for (size_t index = 0; index < restore_count; index++) {
-            u64 paddr = read64(scratch + (protect_count + index) * sizeof(u64)) &
-                        ~restore_tag;
-            sptm_queue_host_rt_restore(paddr);
-        }
+        mmu_map_ram_pages_nc(protect, protect_count, false);
     }
 
     bool changed = false;
@@ -547,22 +516,17 @@ bool sptm_update_disjoint_multipage(struct exc_info *ctx)
 
         // Keep the physmap memory type in sync unless SKIP_PAPT is set.
         if (!(options & BIT(9)) && sptm_is_managed_range(paddr, 1)) {
-            u64 physmap_va = sptm.physmap_base + paddr - sptm.managed_start;
-            u64 physmap_slot = sptm_walk(sptm.kernel_root, physmap_va, 3, NULL);
-            u64 old = read64(physmap_slot);
+            u64 physmap_slot = sptm_walk(sptm.kernel_root, sptm_physmap_va(paddr), 3, NULL);
             u64 physmap_mask = (3ULL << 8) | (7ULL << 2);
-            u64 replacement = (old & ~physmap_mask) | (papt_template & physmap_mask);
-            write64(physmap_slot, replacement);
+            write64(physmap_slot,
+                    (read64(physmap_slot) & ~physmap_mask) | (papt_template & physmap_mask));
             changed = true;
         }
 
         for (size_t index = 0; index < inner_count; index++, scratch_index++) {
             u64 op = stream + (used + index) * 24;
-            u64 slot = sptm_walk(read64(op), read64(op + 8), 3, NULL);
-            u64 old = read64(slot);
-            u64 template = read64(op + 16);
-            write64(scratch + scratch_index * sizeof(u64), old);
-            write64(slot, (old & ~mask) | (template & mask));
+            sptm_update_leaf(sptm_walk(read64(op), read64(op + 8), 3, NULL), read64(op + 16), mask,
+                             scratch + scratch_index * sizeof(u64));
             changed = true;
         }
         used += inner_count;
@@ -586,19 +550,9 @@ bool sptm_unmap_region(struct exc_info *ctx)
     u64 scratch = sptm_scratch_pa(ctx);
     bool changed = false;
     for (size_t index = 0; index < count; index++) {
-        u64 slot = sptm_walk(root, start + index * page_size, 3, NULL);
-        u64 old = slot ? read64(slot) : 0;
-        write64(scratch + index * sizeof(u64), old);
-        if (slot && (old & 1)) {
-            if (!sptm_adjust_mapping_ref(old, geometry.descriptor_mask, -1))
-                return false;
-            if (!sptm_adjust_table_valid(slot, -1)) {
-                sptm_adjust_mapping_ref(old, geometry.descriptor_mask, 1);
-                return false;
-            }
-            write64(slot, 0);
-            changed = true;
-        }
+        if (!sptm_unmap_leaf(sptm_walk(root, start + index * page_size, 3, NULL),
+                             geometry.descriptor_mask, scratch + index * sizeof(u64), &changed))
+            return false;
     }
 
     return sptm_finish_update(ctx, changed, changed && (options & BIT(8)));
@@ -614,18 +568,9 @@ bool sptm_unmap_disjoint(struct exc_info *ctx)
         u64 op = ops + index * 24;
         struct sptm_geometry geometry;
         u64 slot = sptm_walk(read64(op), read64(op + 8), 3, &geometry);
-        u64 old = slot ? read64(slot) : 0;
-        write64(scratch + index * sizeof(u64), old);
-        if (slot && (old & 1)) {
-            if (!sptm_adjust_mapping_ref(old, geometry.descriptor_mask, -1))
-                return false;
-            if (!sptm_adjust_table_valid(slot, -1)) {
-                sptm_adjust_mapping_ref(old, geometry.descriptor_mask, 1);
-                return false;
-            }
-            write64(slot, 0);
-            changed = true;
-        }
+        if (!sptm_unmap_leaf(slot, geometry.descriptor_mask, scratch + index * sizeof(u64),
+                             &changed))
+            return false;
     }
 
     return sptm_finish_update(ctx, changed, false);
@@ -695,33 +640,19 @@ bool sptm_surt_update(struct exc_info *ctx, bool allocate)
 bool sptm_condemn_leaf_table(struct exc_info *ctx, bool condemn)
 {
     u64 slot = sptm_walk(ctx->regs[0], ctx->regs[1], 2, NULL);
-    if (!slot) {
-        ctx->regs[0] = SPTM_STATUS_TABLE_NOT_PRESENT;
-        return true;
-    }
-
-    u64 value = read64(slot);
+    u64 value = slot ? read64(slot) : 0;
     if (!(value & 1)) {
         ctx->regs[0] = SPTM_STATUS_TABLE_NOT_PRESENT;
         return true;
     }
 
-    if (condemn) {
-        // Only one caller may condemn a table.
-        if (value & BIT(2)) {
-            ctx->regs[0] = SPTM_STATUS_TABLE_NOT_PRESENT;
-            return true;
-        }
-
-        write64(slot, value | BIT(2));
-    } else {
-        if (!(value & BIT(2))) {
-            /* Endpoint 44 is an idempotent clear operation. */
-            ctx->regs[0] = SPTM_STATUS_SUCCESS;
-            return true;
-        }
-        write64(slot, value & ~BIT(2));
+    // Only one caller may condemn a table; clearing is idempotent.
+    if (!!(value & BIT(2)) == condemn) {
+        ctx->regs[0] = condemn ? SPTM_STATUS_TABLE_NOT_PRESENT : SPTM_STATUS_SUCCESS;
+        return true;
     }
+
+    write64(slot, value ^ BIT(2));
     sptm_publish_stage1();
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
