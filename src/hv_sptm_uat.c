@@ -77,6 +77,16 @@ static void sptm_uat_publish_guard(u64 state_pa, u8 guard)
     sysop("dsb osh");
 }
 
+// Start a resumable operation: set its cursors and guard. CURSOR2 always starts at 0.
+static void sptm_uat_begin(u64 state_pa, u8 guard, u64 cursor0, u64 cursor1, u64 cursor3)
+{
+    write64(state_pa + UAT_STATE_CURSOR0, cursor0);
+    write64(state_pa + UAT_STATE_CURSOR1, cursor1);
+    write64(state_pa + UAT_STATE_CURSOR2, 0);
+    write64(state_pa + UAT_STATE_CURSOR3, cursor3);
+    sptm_uat_publish_guard(state_pa, guard);
+}
+
 static void sptm_uat_write_descriptor(u64 slot, u64 descriptor)
 {
     // this is where we would use the coprocessor flush op
@@ -314,13 +324,9 @@ static bool sptm_uat_map_begin(struct exc_info *ctx)
 
     memcpy((void *)(state_pa + UAT_STATE_MAP_SEGMENTS), (void *)ctx->regs[2],
            segment_count * sizeof(struct sptm_uat_segment));
-    write64(state_pa + UAT_STATE_CURSOR0, sptm_uat_normalize_va(ctx->regs[1]));
-    write64(state_pa + UAT_STATE_CURSOR1, segment_count);
-    write64(state_pa + UAT_STATE_CURSOR2, 0);
-    write64(state_pa + UAT_STATE_CURSOR3, 0);
     write32(state_pa + UAT_STATE_OPTIONS, ctx->regs[4]);
     write8(state_pa + UAT_STATE_FLUSH_LEVEL, 0);
-    sptm_uat_publish_guard(state_pa, UAT_GUARD_MAP);
+    sptm_uat_begin(state_pa, UAT_GUARD_MAP, sptm_uat_normalize_va(ctx->regs[1]), segment_count, 0);
     return sptm_uat_map_continue(ctx);
 }
 
@@ -362,12 +368,8 @@ static bool sptm_uat_prepare_unmap_begin(struct exc_info *ctx)
     u64 state_pa = ctx->regs[0];
     u64 count = ctx->regs[2];
 
-    write64(state_pa + UAT_STATE_CURSOR0, sptm_uat_normalize_va(ctx->regs[1]));
-    write64(state_pa + UAT_STATE_CURSOR1, count);
-    write64(state_pa + UAT_STATE_CURSOR2, 0);
-    write64(state_pa + UAT_STATE_CURSOR3,
-            count ? sptm_uat_handoff_slot_for_state(state_pa) + 1 : 0);
-    sptm_uat_publish_guard(state_pa, UAT_GUARD_PREPARE_UNMAP);
+    sptm_uat_begin(state_pa, UAT_GUARD_PREPARE_UNMAP, sptm_uat_normalize_va(ctx->regs[1]), count,
+                   count ? sptm_uat_handoff_slot_for_state(state_pa) + 1 : 0);
     return sptm_uat_prepare_unmap_continue(ctx);
 }
 
@@ -387,7 +389,7 @@ static bool sptm_uat_unmap_continue(struct exc_info *ctx)
         return true;
     }
 
-    // Validate, then clear VALID/TYPE while keeping the payload for handoff, then release.
+    // Clear VALID/TYPE while keeping the payload for handoff, then release the targets.
     while (budget && segment_index < segment_count) {
         struct sptm_uat_segment *segment =
             (void *)(state_pa + UAT_STATE_UNMAP_SEGMENTS + segment_index * sizeof(*segment));
@@ -426,13 +428,9 @@ static bool sptm_uat_unmap_continue(struct exc_info *ctx)
         ctx->regs[0] = 0;
         return true;
     }
-    if (phase == UAT_UNMAP_PHASE_CLEAR)
-        sptm_uat_handoff_complete(state_pa);
 
-    write64(state_pa + UAT_STATE_CURSOR1, 0);
-    write64(state_pa + UAT_STATE_CURSOR2, 0);
-    write64(state_pa + UAT_STATE_CURSOR3, phase + 1);
-    sptm_uat_publish_guard(state_pa, UAT_GUARD_UNMAP);
+    sptm_uat_handoff_complete(state_pa);
+    sptm_uat_begin(state_pa, UAT_GUARD_UNMAP, segment_count, 0, UAT_UNMAP_PHASE_RELEASE);
     ctx->regs[0] = 1;
     return true;
 }
@@ -444,12 +442,8 @@ static bool sptm_uat_unmap_begin(struct exc_info *ctx)
 
     memcpy((void *)(state_pa + UAT_STATE_UNMAP_SEGMENTS), (void *)ctx->regs[1],
            segment_count * sizeof(struct sptm_uat_segment));
-    write64(state_pa + UAT_STATE_CURSOR0, segment_count);
-    write64(state_pa + UAT_STATE_CURSOR1, 0);
-    write64(state_pa + UAT_STATE_CURSOR2, 0);
-    write64(state_pa + UAT_STATE_CURSOR3, UAT_UNMAP_PHASE_VALIDATE);
     write64(state_pa + UAT_STATE_UNMAP_FLUSH_COUNT, 0);
-    sptm_uat_publish_guard(state_pa, UAT_GUARD_UNMAP);
+    sptm_uat_begin(state_pa, UAT_GUARD_UNMAP, segment_count, 0, UAT_UNMAP_PHASE_CLEAR);
     return sptm_uat_unmap_continue(ctx);
 }
 
