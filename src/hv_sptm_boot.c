@@ -196,6 +196,16 @@ static bool sptm_boot_bool_property(const int *nodes, size_t count, const char *
     return fallback;
 }
 
+static u64 sptm_boot_alloc(struct sptm_boot_context *context, size_t size, size_t alignment)
+{
+    return (u64)sptm_alloc_zero(&context->allocator, size, alignment);
+}
+
+static u64 sptm_boot_alloc_page(struct sptm_boot_context *context)
+{
+    return sptm_boot_alloc(context, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+}
+
 static u64 sptm_boot_va(const struct sptm_boot_context *context, u64 pa)
 {
     return context->physmap_base + pa - context->managed_start;
@@ -203,7 +213,7 @@ static u64 sptm_boot_va(const struct sptm_boot_context *context, u64 pa)
 
 static u64 sptm_boot_alloc_table(struct sptm_boot_context *context, u8 level)
 {
-    u64 pa = (u64)sptm_alloc_zero(&context->allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+    u64 pa = sptm_boot_alloc_page(context);
     assert(sptm_boot.page_count < ARRAY_SIZE(sptm_boot.pages));
     sptm_boot.pages[sptm_boot.page_count++] = (struct sptm_boot_pt_page){pa, level};
     return pa;
@@ -403,41 +413,30 @@ u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text
     size_t frame_table_size = managed_pages * SPTM_FRAME_ENTRY_SIZE;
     size_t external_ref_table_size = managed_pages * 8;
 
-    context.bootstrap_pa = (u64)sptm_alloc_zero(&context.allocator, SPTM_BOOTSTRAP_SIZE, 16);
-    u64 debug_header_pa = (u64)sptm_alloc_zero(&context.allocator, 0x100, 16);
-    context.panic_state_pa =
-        (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    u64 papt_count_pa = (u64)sptm_alloc_zero(&context.allocator, sizeof(u32), 4);
-    u64 papt_ranges_pa =
-        (u64)sptm_alloc_zero(&context.allocator, 3 * sizeof(struct sptm_boot_papt), 8);
-    u64 trace_buffer_pa = (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    u64 dispatch_states_pa =
-        (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    u64 saved_states_pa = (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    u64 event_counters_pa =
-        (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    context.scratch_pa =
-        (u64)sptm_alloc_zero(&context.allocator, cpu_count * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    u64 txm_stack_array_pa = (u64)sptm_alloc_zero(&context.allocator, cpu_count * sizeof(u64), 8);
-    u64 txm_stacks_pa =
-        (u64)sptm_alloc_zero(&context.allocator, cpu_count * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    u64 txm_info_pa = (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+    context.bootstrap_pa = sptm_boot_alloc(&context, SPTM_BOOTSTRAP_SIZE, 16);
+    u64 debug_header_pa = sptm_boot_alloc(&context, 0x100, 16);
+    context.panic_state_pa = sptm_boot_alloc_page(&context);
+    u64 papt_count_pa = sptm_boot_alloc(&context, sizeof(u32), 4);
+    u64 papt_ranges_pa = sptm_boot_alloc(&context, 3 * sizeof(struct sptm_boot_papt), 8);
+    u64 trace_buffer_pa = sptm_boot_alloc_page(&context);
+    u64 dispatch_states_pa = sptm_boot_alloc_page(&context);
+    u64 saved_states_pa = sptm_boot_alloc_page(&context);
+    u64 event_counters_pa = sptm_boot_alloc_page(&context);
+    context.scratch_pa = sptm_boot_alloc(&context, cpu_count * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+    u64 txm_stack_array_pa = sptm_boot_alloc(&context, cpu_count * sizeof(u64), 8);
+    u64 txm_stacks_pa = sptm_boot_alloc(&context, cpu_count * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+    u64 txm_info_pa = sptm_boot_alloc_page(&context);
     context.txm_info_va = sptm_boot_va(&context, txm_info_pa);
-    context.uat_global_state_pa =
-        (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    context.uat_global_root_pa =
-        (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    u64 kernel_stacks_pa =
-        (u64)sptm_alloc_zero(&context.allocator, SPTM_CPU_STACK_WINDOW_SIZE, SPTM_PAGE_SIZE);
+    context.uat_global_state_pa = sptm_boot_alloc_page(&context);
+    context.uat_global_root_pa = sptm_boot_alloc_page(&context);
+    u64 kernel_stacks_pa = sptm_boot_alloc(&context, SPTM_CPU_STACK_WINDOW_SIZE, SPTM_PAGE_SIZE);
     // Keep EL2-only RO/WX reservations after the ABI-visible frame table.
-    context.frame_table_pa = (u64)sptm_alloc_zero(
-        &context.allocator, frame_table_size + external_ref_table_size, SPTM_PAGE_SIZE);
+    context.frame_table_pa =
+        sptm_boot_alloc(&context, frame_table_size + external_ref_table_size, SPTM_PAGE_SIZE);
     context.frame_table = (void *)context.frame_table_pa;
-    u64 frame_params_pa =
-        (u64)sptm_alloc_zero(&context.allocator, 256 * SPTM_FRAME_PARAM_SIZE, SPTM_PAGE_SIZE);
-    u64 pt_attrs_pa = (u64)sptm_alloc_zero(&context.allocator, 6 * sizeof(u64), 8);
-    u64 ttbr0_zero_page_pa =
-        (u64)sptm_alloc_zero(&context.allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+    u64 frame_params_pa = sptm_boot_alloc(&context, 256 * SPTM_FRAME_PARAM_SIZE, SPTM_PAGE_SIZE);
+    u64 pt_attrs_pa = sptm_boot_alloc(&context, 6 * sizeof(u64), 8);
+    u64 ttbr0_zero_page_pa = sptm_boot_alloc_page(&context);
 
     u32 io_ranges_bytes, io_filters_bytes;
     const void *raw_io_ranges = adt_getprop(adt, defaults, "pmap-io-ranges", &io_ranges_bytes);

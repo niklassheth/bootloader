@@ -48,7 +48,7 @@ static bool sptm_dart_flush_sid(struct sptm_dart *dart, u32 sid)
 
 static bool sptm_dart_flush_range(struct sptm_dart *dart, u32 sid, u64 start, u64 end)
 {
-    if (!(dart->flags & SPTM_DART_FLUSH_BY_DVA) || !dart->hardware_flush_supported || start >= end)
+    if (!(dart->flags & SPTM_DART_FLUSH_BY_DVA) || !dart->hardware_flush_supported)
         return sptm_dart_flush_sid(dart, sid);
     return sptm_dart_tlb_op(
         dart, DART_TLB_HARDWARE_FLUSH | DART_TLB_FLUSH_DVA | DART_TLB_FLUSH_SID | sid, start, end);
@@ -106,49 +106,29 @@ static void sptm_dart_set_ttbr(struct sptm_dart *dart, u32 sid, u32 ttbr)
     }
 }
 
-static bool sptm_dart_map_table(struct exc_info *ctx, struct sptm_dart *dart)
+// MAP_TABLE and UNMAP_TABLE: install or clear the SID's root, or one table descriptor.
+static bool sptm_dart_set_table(struct exc_info *ctx, struct sptm_dart *dart, bool map)
 {
     u32 sid = ctx->regs[1];
     u64 dva = ctx->regs[2];
     u32 level = ctx->regs[3];
-    u64 table_pa = ctx->regs[4];
+    u64 table_pa = map ? ctx->regs[4] : 0;
     struct sptm_dart_sid *state = &dart->sid_states[sid];
+    bool flushed;
 
     if (level == state->root_level) {
-        sptm_dart_set_ttbr(dart, sid, ((table_pa >> 12) & 0xfffffffcULL) | DART_TTBR_VALID);
+        sptm_dart_set_ttbr(dart, sid,
+                           map ? ((table_pa >> 12) & 0xfffffffcULL) | DART_TTBR_VALID : 0);
         state->root = table_pa;
-        if (!sptm_dart_flush_sid(dart, sid))
-            return false;
+        flushed = sptm_dart_flush_sid(dart, sid);
     } else {
-        write64(sptm_dart_slot(state, dva, level - 1), sptm_dart_desc(table_pa));
-        if (!sptm_dart_flush_entry(dart, sid, dva, level - 1))
-            return false;
+        write64(sptm_dart_slot(state, dva, level - 1), map ? sptm_dart_desc(table_pa) : 0);
+        flushed = sptm_dart_flush_entry(dart, sid, dva, level - 1);
     }
 
-    ctx->regs[0] = SPTM_STATUS_SUCCESS;
-    return true;
-}
-
-static bool sptm_dart_unmap_table(struct exc_info *ctx, struct sptm_dart *dart)
-{
-    u32 sid = ctx->regs[1];
-    u64 dva = ctx->regs[2];
-    u32 level = ctx->regs[3];
-    struct sptm_dart_sid *state = &dart->sid_states[sid];
-
-    if (level == state->root_level) {
-        sptm_dart_set_ttbr(dart, sid, 0);
-        state->root = 0;
-        if (!sptm_dart_flush_sid(dart, sid))
-            return false;
-    } else {
-        write64(sptm_dart_slot(state, dva, level - 1), 0);
-        if (!sptm_dart_flush_entry(dart, sid, dva, level - 1))
-            return false;
-    }
-
-    ctx->regs[0] = SPTM_STATUS_SUCCESS;
-    return true;
+    if (flushed)
+        ctx->regs[0] = SPTM_STATUS_SUCCESS;
+    return flushed;
 }
 
 static u64 sptm_dart_page_pte(const struct sptm_dart *dart, u64 dva, u64 size, u64 page_dva,
@@ -279,10 +259,10 @@ bool sptm_handle_dart(struct exc_info *ctx, u32 endpoint)
     spin_lock(&sptm.service_lock);
     switch (endpoint) {
         case 0: /* MAP_TABLE */
-            handled = sptm_dart_map_table(ctx, dart);
+            handled = sptm_dart_set_table(ctx, dart, true);
             break;
         case 1: /* UNMAP_TABLE */
-            handled = sptm_dart_unmap_table(ctx, dart);
+            handled = sptm_dart_set_table(ctx, dart, false);
             break;
         case 2: /* MAP_PAGE */
             handled = sptm_dart_map_pages(ctx, dart);
