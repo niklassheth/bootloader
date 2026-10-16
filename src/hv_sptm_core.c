@@ -2,31 +2,12 @@
 
 #include "hv_sptm_internal.h"
 
-#include "mcc.h"
-
 struct sptm_state sptm;
 
 // Whether [pa, pa + size) lies in XNU-managed RAM, which has frame-table entries.
 bool sptm_is_managed_range(u64 pa, size_t size)
 {
     return pa >= sptm.managed_start && pa < sptm.managed_end && size <= sptm.managed_end - pa;
-}
-
-bool sptm_valid_platform_pa(u64 pa, size_t size)
-{
-    if (!size || pa < ram_base || pa >= ram_base + mem_size_actual ||
-        size > ram_base + mem_size_actual - pa)
-        return false;
-
-    u64 end = pa + size;
-    for (size_t index = 0; index < mcc_carveout_count; index++) {
-        u64 carveout_start = mcc_carveouts[index].base;
-        u64 carveout_end = carveout_start + mcc_carveouts[index].size;
-        if (pa < carveout_end && carveout_start < end)
-            return false;
-    }
-
-    return true;
 }
 
 // XNU passes its own data as physmap addresses; physical addresses pass through.

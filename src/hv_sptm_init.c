@@ -336,11 +336,7 @@ static void sptm_init_nvme(struct sptm_allocator *allocator)
     struct sptm_nvme *nvme = &sptm.nvme;
     nvme->queue_entries = sptm_adt_integer(ans, "nvme-queue-entries", 64);
     nvme->tl_wa = sptm_adt_has(ans, "nvme-tl-wa");
-    nvme->tl_slots = nvme->tl_wa ? sptm_adt_integer(ans, "nvme-num-sl", 0) : 0;
-    if (!nvme->queue_entries || (nvme->tl_wa && (!nvme->tl_slots || nvme->tl_slots > 16))) {
-        printf("HV: refusing inconsistent SPTM NVMe configuration\n");
-        return;
-    }
+    nvme->tl_slots = sptm_adt_integer(ans, "nvme-num-sl", 0);
 
     u64 tcb_bytes = ALIGN_UP(nvme->queue_entries * SPTM_NVME_TCB_SIZE, SPTM_NVME_TCB_ALIGNMENT);
     u64 prp_bytes = ALIGN_UP(nvme->queue_entries * SPTM_NVME_PRP_SLOT_SIZE, SPTM_PAGE_SIZE);
@@ -363,7 +359,6 @@ static void sptm_init_nvme(struct sptm_allocator *allocator)
         adt_get_reg(adt, ans_path, "reg", 13, &nvme->vdma_status, NULL);
     if (sptm_adt_has(ans, "nvme-ans-sha-present"))
         adt_get_reg(adt, ans_path, "reg", 14, &nvme->sha_base, NULL);
-    nvme->configured = true;
 }
 
 // The caller has already switched adt to the guest device tree.

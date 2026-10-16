@@ -136,9 +136,6 @@
 #define UAT_HANDOFF_MAGIC       0x4b1d000000000002ULL
 #define UAT_HANDOFF_MAGIC_AP    0x000
 #define UAT_HANDOFF_MAGIC_FW    0x008
-#define UAT_HANDOFF_LOCK_AP     0x010
-#define UAT_HANDOFF_LOCK_FW     0x011
-#define UAT_HANDOFF_TURN        0x014
 #define UAT_HANDOFF_CURRENT_CTX 0x018
 #define UAT_HANDOFF_SLOT_BASE   0x020
 #define UAT_HANDOFF_SLOT_STRIDE 0x018
@@ -147,7 +144,6 @@
 #define UAT_HANDOFF_SLOT_SIZE   0x010
 #define UAT_HANDOFF_SLOT_COUNT  0x041
 #define UAT_HANDOFF_SHARED_SLOT 0x040
-#define UAT_HANDOFF_UNK3        0x640
 #define UAT_HANDOFF_MIN_SIZE    0x648
 #define UAT_HANDOFF_UNMAP_TAG   0xdead000000000000ULL
 #define UAT_HANDOFF_ADDR_MASK   0x0000ffffffffffffULL
@@ -306,7 +302,6 @@ static_assert((SPTM_NVME_MAX_PRPS - 1) * sizeof(u64) <= SPTM_NVME_PRP_SLOT_SIZE,
               "NVMe PRP list exceeds its per-CID slot");
 
 struct sptm_nvme {
-    bool configured;
     bool prp_flush_wa;
     bool tl_wa;
     bool vdma_wa;
@@ -349,7 +344,6 @@ struct sptm_state {
     u8 uat_va_width;
     u8 uat_mode;
     bool uat_tlbi_at_retype;
-    bool uat_configured;
     u64 txm_info_va;
     u64 sart_base;
     u64 sart_canary;
@@ -381,7 +375,6 @@ void sptm_init_platform(struct sptm_allocator *allocator);
 
 /* Core */
 bool sptm_is_managed_range(u64 pa, size_t size);
-bool sptm_valid_platform_pa(u64 pa, size_t size);
 u64 sptm_pointer_pa(u64 pointer);
 u64 sptm_physmap_va(u64 pa);
 u64 sptm_iommu_table_va(u64 pa);
@@ -408,7 +401,7 @@ void sptm_adjust_parent_links(u64 child, int delta);
 void sptm_adjust_mapping_ref(u64 pte, u64 descriptor_mask, int delta);
 
 /* UAT */
-void sptm_uat_configure(u64 global_root_pa, u64 shared_l2_size, u64 handoff_pa, u64 handoff_size);
+void sptm_uat_configure(u64 global_root_pa, u64 handoff_pa);
 void sptm_uat_tlbi_all(void);
 bool sptm_handle_uat(struct exc_info *ctx, u32 endpoint);
 

@@ -168,9 +168,6 @@ static void sptm_nvme_mmio_write64_lo_hi(u64 address, u64 value)
 
 bool sptm_handle_nvme(struct exc_info *ctx, u32 endpoint)
 {
-    if (!sptm.nvme.configured)
-        return false;
-
     struct sptm_nvme *nvme = &sptm.nvme;
     u64 *args = ctx->regs;
     bool handled = true;

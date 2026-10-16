@@ -486,7 +486,6 @@ u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text
     bootargs->devtree = (void *)(extradata_va + guest_adt - extradata_pa);
 
     context.uat_l2_pa = sptm_adt_integer(sgx, "gfx-shared-l2-region-base", 0);
-    u64 uat_l2_size = sptm_adt_integer(sgx, "gfx-shared-l2-region-size", 0);
     // XNU adopts these empty L3s before normal pmap allocation is operational.
     // The fixed 64 MiB term stands in for the boot framebuffer size.
     u64 memory_segments = ALIGN_UP(bootargs->mem_size, BIT(28)) >> 28;
@@ -660,9 +659,7 @@ u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text
     sptm.uat_va_width = uat_va_width;
     sptm.uat_mode = uat_mode;
     sptm.uat_tlbi_at_retype = uat_tlbi_at_retype;
-    sptm_uat_configure(context.uat_global_root_pa, uat_l2_size,
-                       sptm_adt_integer(sgx, "gfx-handoff-base", 0),
-                       sptm_adt_integer(sgx, "gfx-handoff-size", 0));
+    sptm_uat_configure(context.uat_global_root_pa, sptm_adt_integer(sgx, "gfx-handoff-base", 0));
     sptm_init_platform(&context.allocator);
 
     sptm_boot.entry = context.kernel_entry;

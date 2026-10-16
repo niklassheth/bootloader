@@ -227,7 +227,7 @@ bool sptm_retype_frame(struct exc_info *ctx)
         sptm_publish_stage1();
     else
         sysop("dsb ishst");
-    if (iommu_transition && sptm.uat_configured && sptm.uat_tlbi_at_retype)
+    if (iommu_transition && sptm.uat_tlbi_at_retype)
         sptm_uat_tlbi_all();
 
     // Restore WB aliases only after guest and IOMMU invalidation.

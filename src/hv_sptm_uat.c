@@ -515,53 +515,28 @@ bool sptm_handle_uat(struct exc_info *ctx, u32 endpoint)
         sptm_uat_remove_context,
         sptm_uat_get_info,
     };
-    if (!sptm.uat_configured || endpoint >= ARRAY_SIZE(handlers))
-        return false;
-
     spin_lock(&sptm.service_lock);
     bool handled = handlers[endpoint](ctx);
     spin_unlock(&sptm.service_lock);
     return handled;
 }
 
-// Boot fills in the UAT parameters; leave UAT disabled if the device tree is unusable.
-void sptm_uat_configure(u64 global_root_pa, u64 shared_l2_size, u64 handoff_pa, u64 handoff_size)
+// Boot fills in the UAT parameters from the device tree before calling this.
+void sptm_uat_configure(u64 global_root_pa, u64 handoff_pa)
 {
     sptm.uat_state_size =
         UAT_STATE_UNMAP_SEGMENTS + sptm.uat_segment_limit * sizeof(struct sptm_uat_segment);
-    if ((sptm.uat_shared_l2_pa & SPTM_PAGE_MASK) || shared_l2_size != SPTM_PAGE_SIZE ||
-        !sptm_valid_platform_pa(sptm.uat_shared_l2_pa, shared_l2_size) || sptm.uat_va_width < 37 ||
-        sptm.uat_va_width > 48 || sptm.uat_mode > 1 || !sptm.uat_segment_limit ||
-        !sptm.uat_mapping_limit || sptm.uat_state_size > SPTM_PAGE_SIZE ||
-        (sptm.uat_gpu_contexts & (2 * sizeof(u64) - 1)) ||
-        !sptm_valid_platform_pa(sptm.uat_gpu_contexts, 64 * 2 * sizeof(u64)) || !handoff_pa ||
-        (handoff_pa & SPTM_PAGE_MASK) || handoff_size < UAT_HANDOFF_MIN_SIZE ||
-        (handoff_size & SPTM_PAGE_MASK) || !sptm_valid_platform_pa(handoff_pa, handoff_size)) {
-        printf("HV: refusing invalid SPTM UAT configuration\n");
-        return;
-    }
 
     // Boot-seeded UAT tables bypass RETYPE, so retire their WB aliases here.
     u64 host_pages[] = {global_root_pa, sptm.uat_shared_l2_pa};
     mmu_map_ram_pages_nc(host_pages, ARRAY_SIZE(host_pages), true);
 
-    // GFXHandoff still exposes CUR_CTX under its historical UNK name.
+    // GFXHandoff still exposes CUR_CTX under its historical UNK name. Publish the AP
+    // magic only after the rest of the page is reset.
     sptm.uat_handoff_pa = handoff_pa;
-    write64(handoff_pa + UAT_HANDOFF_MAGIC_AP, 0);
-    write64(handoff_pa + UAT_HANDOFF_MAGIC_FW, 0);
-    write8(handoff_pa + UAT_HANDOFF_LOCK_AP, 0);
-    write8(handoff_pa + UAT_HANDOFF_LOCK_FW, 0);
-    write32(handoff_pa + UAT_HANDOFF_TURN, 0);
+    memset((void *)handoff_pa, 0, UAT_HANDOFF_MIN_SIZE);
     write32(handoff_pa + UAT_HANDOFF_CURRENT_CTX, UINT32_MAX);
-    for (u32 slot = 0; slot < UAT_HANDOFF_SLOT_COUNT; slot++) {
-        u64 slot_addr = sptm_uat_handoff_slot_addr(slot);
-        write64(slot_addr + UAT_HANDOFF_SLOT_STATE, 0);
-        write64(slot_addr + UAT_HANDOFF_SLOT_ADDR, 0);
-        write64(slot_addr + UAT_HANDOFF_SLOT_SIZE, 0);
-    }
-    write64(handoff_pa + UAT_HANDOFF_UNK3, 0);
     sysop("dsb osh");
     write64(handoff_pa + UAT_HANDOFF_MAGIC_AP, UAT_HANDOFF_MAGIC);
     sysop("dsb osh");
-    sptm.uat_configured = true;
 }
