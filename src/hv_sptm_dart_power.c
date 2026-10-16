@@ -237,8 +237,8 @@ static bool sptm_dart_program_sids(struct sptm_dart *dart)
     return sptm_dart_flush_all(dart);
 }
 
-// All instances of one DART share a version and SID capacity.
-static bool sptm_dart_discover(struct sptm_dart *dart)
+// INIT discovers the version and SID capacity, which all instances of one DART share.
+bool sptm_dart_init(struct exc_info *ctx, struct sptm_dart *dart)
 {
     u32 params_8 = read32(dart->instances[0] + DART_PARAMS_8);
     u32 params_c = read32(dart->instances[0] + DART_PARAMS_C);
@@ -255,6 +255,7 @@ static bool sptm_dart_discover(struct sptm_dart *dart)
     for (size_t index = 0; index < dart->instance_count; index++)
         dart->hardware_flush_supported &=
             !!(read32(dart->instances[index] + DART_PARAMS_4) & BIT(3));
+    ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
 }
 
@@ -353,14 +354,6 @@ bool sptm_dart_power(struct exc_info *ctx, struct sptm_dart *dart, bool power_up
         dart->powered = false;
     }
 
-    ctx->regs[0] = SPTM_STATUS_SUCCESS;
-    return true;
-}
-
-bool sptm_dart_init(struct exc_info *ctx, struct sptm_dart *dart)
-{
-    if (!sptm_dart_discover(dart))
-        return false;
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
 }

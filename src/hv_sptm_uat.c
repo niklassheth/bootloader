@@ -50,7 +50,6 @@ static u64 sptm_uat_handoff_post(u64 state_pa, u32 slot, u64 va, u64 count)
     write64(slot_addr + UAT_HANDOFF_SLOT_STATE, request_flush ? 1 : 2);
     sysop("dsb osh");
 
-    sptm.uat_handoff_pending[slot] = true;
     sptm.uat_handoff_owner[slot] = state_pa;
     return request_flush ? 2 : 0;
 }
@@ -58,14 +57,13 @@ static u64 sptm_uat_handoff_post(u64 state_pa, u32 slot, u64 va, u64 count)
 static void sptm_uat_handoff_complete(u64 state_pa)
 {
     for (u32 slot = 0; slot < UAT_HANDOFF_SLOT_COUNT; slot++) {
-        if (!sptm.uat_handoff_pending[slot] || sptm.uat_handoff_owner[slot] != state_pa)
+        if (sptm.uat_handoff_owner[slot] != state_pa)
             continue;
 
         u64 state_addr = sptm_uat_handoff_slot_addr(slot) + UAT_HANDOFF_SLOT_STATE;
         sptm_uat_handoff_acquire(state_addr, sizeof(u32));
         write32(state_addr, 0);
         sysop("dsb osh");
-        sptm.uat_handoff_pending[slot] = false;
         sptm.uat_handoff_owner[slot] = 0;
     }
 }
@@ -314,7 +312,6 @@ static bool sptm_uat_map_begin(struct exc_info *ctx)
     memcpy((void *)(state_pa + UAT_STATE_MAP_SEGMENTS), (void *)ctx->regs[2],
            segment_count * sizeof(struct sptm_uat_segment));
     write32(state_pa + UAT_STATE_OPTIONS, ctx->regs[4]);
-    write8(state_pa + UAT_STATE_FLUSH_LEVEL, 0);
     sptm_uat_begin(state_pa, UAT_GUARD_MAP, sptm_uat_normalize_va(ctx->regs[1]), segment_count, 0);
     return sptm_uat_map_continue(ctx);
 }
@@ -431,7 +428,6 @@ static bool sptm_uat_unmap_begin(struct exc_info *ctx)
 
     memcpy((void *)(state_pa + UAT_STATE_UNMAP_SEGMENTS), (void *)ctx->regs[1],
            segment_count * sizeof(struct sptm_uat_segment));
-    write64(state_pa + UAT_STATE_UNMAP_FLUSH_COUNT, 0);
     sptm_uat_begin(state_pa, UAT_GUARD_UNMAP, segment_count, 0, UAT_UNMAP_PHASE_CLEAR);
     return sptm_uat_unmap_continue(ctx);
 }

@@ -106,9 +106,7 @@
 #define UAT_STATE_CURSOR2           0x30
 #define UAT_STATE_CURSOR3           0x38
 #define UAT_STATE_OPTIONS           0x40
-#define UAT_STATE_FLUSH_LEVEL       0x44
 #define UAT_STATE_MAP_SEGMENTS      0x48
-#define UAT_STATE_UNMAP_FLUSH_COUNT 0x248
 #define UAT_STATE_UNMAP_SEGMENTS    0x250
 
 #define UAT_STATE_SINGLE_ROOT  1
@@ -344,7 +342,6 @@ struct sptm_state {
     u64 uat_shared_l2_pa;
     u64 uat_shared_l2_va;
     u64 uat_handoff_pa;
-    bool uat_handoff_pending[UAT_HANDOFF_SLOT_COUNT];
     u64 uat_handoff_owner[UAT_HANDOFF_SLOT_COUNT];
     u32 uat_segment_limit;
     u32 uat_mapping_limit;
@@ -358,7 +355,6 @@ struct sptm_state {
     u64 sart_canary;
     u16 sart_protected_mask;
     u16 sart_guarded_mask;
-    u16 sart_guard_count;
     bool sart_exclusive_bounds;
     spinlock_t service_lock;
     struct sptm_cpu cpus[MAX_CPUS];
