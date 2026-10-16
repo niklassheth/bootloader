@@ -6,6 +6,12 @@ static const u16 sptm_dart_counter_offsets[] = {
     0x760, 0x764, 0x768, 0x770, 0x774, 0x778, 0x780, 0x784, 0x788,
 };
 
+// Powered-down or absent DART registers read as DART_UNAVAILABLE or all ones.
+static bool sptm_dart_live(u32 value)
+{
+    return value != DART_UNAVAILABLE && value != UINT32_MAX;
+}
+
 static bool sptm_dart_clear_errors(const struct sptm_dart *dart)
 {
     for (size_t index = 0; index < dart->instance_count; index++) {
@@ -16,18 +22,18 @@ static bool sptm_dart_clear_errors(const struct sptm_dart *dart)
             for (size_t word = 0; word < dart->sid_words; word++) {
                 u64 address = base + DART_SID_EXCEPTIONS + word * sizeof(u32);
                 u32 pending = read32(address);
-                if (pending && pending != DART_UNAVAILABLE && pending != UINT32_MAX)
+                if (pending && sptm_dart_live(pending))
                     write32(address, pending);
             }
         } else {
             u32 error = read32(base + DART_ERROR);
-            if (error == DART_UNAVAILABLE || error == UINT32_MAX)
+            if (!sptm_dart_live(error))
                 return false;
             if (error & DART_ERROR_SECONDARY) {
                 if (!(dart->flags & SPTM_DART_IGNORE_SECONDARY))
                     return false;
                 u32 secondary = read32(base + 0x1c0);
-                if (secondary && secondary != DART_UNAVAILABLE && secondary != UINT32_MAX)
+                if (secondary && sptm_dart_live(secondary))
                     write32(base + 0x1c0, secondary);
             }
             if (error)
@@ -38,6 +44,16 @@ static bool sptm_dart_clear_errors(const struct sptm_dart *dart)
     }
 
     sysop("dsb sy");
+    return true;
+}
+
+// Set or clear an FPAG slice's clock protection; fails if the slice is unreadable.
+static bool sptm_dart_clock_protect(u64 address, bool protect)
+{
+    u32 value = read32(address);
+    if (!sptm_dart_live(value))
+        return false;
+    write32(address, protect ? value | FPAG_CLOCK_PROTECTION : value & ~FPAG_CLOCK_PROTECTION);
     return true;
 }
 
@@ -68,7 +84,7 @@ static bool sptm_dart_shared_clock_acquire(u64 address)
 
     if (!ref->refs) {
         u32 value = read32(address);
-        if (value == DART_UNAVAILABLE || value == UINT32_MAX)
+        if (!sptm_dart_live(value))
             return false;
         ref->original = value & FPAG_CLOCK_PROTECTION;
         if (!ref->original)
@@ -88,11 +104,8 @@ static void sptm_dart_shared_clock_release(u64 address)
     if (ref->refs)
         return;
 
-    if (!ref->original) {
-        u32 value = read32(address);
-        if (value != DART_UNAVAILABLE && value != UINT32_MAX)
-            write32(address, value & ~FPAG_CLOCK_PROTECTION);
-    }
+    if (!ref->original)
+        sptm_dart_clock_protect(address, false);
     memset(ref, 0, sizeof(*ref));
 }
 
@@ -120,11 +133,8 @@ static bool sptm_dart_powerup_sidebands(struct sptm_dart *dart)
         }
 
         for (size_t index = 0; index < dart->clock_count; index++) {
-            u64 address = dart->clock_entries[index];
-            u32 value = read32(address);
-            if (value == DART_UNAVAILABLE || value == UINT32_MAX)
+            if (!sptm_dart_clock_protect(dart->clock_entries[index], true))
                 return false;
-            write32(address, value | FPAG_CLOCK_PROTECTION);
         }
     }
     sysop("dsb sy");
@@ -205,12 +215,8 @@ static void sptm_dart_powerdown_sidebands(struct sptm_dart *dart)
         return;
     }
 
-    for (size_t index = 0; index < dart->clock_count; index++) {
-        u64 address = dart->clock_entries[index];
-        u32 value = read32(address);
-        if (value != DART_UNAVAILABLE && value != UINT32_MAX)
-            write32(address, value & ~FPAG_CLOCK_PROTECTION);
-    }
+    for (size_t index = 0; index < dart->clock_count; index++)
+        sptm_dart_clock_protect(dart->clock_entries[index], false);
     sysop("dsb sy");
 }
 
@@ -242,7 +248,7 @@ bool sptm_dart_init(struct exc_info *ctx, struct sptm_dart *dart)
 {
     u32 params_8 = read32(dart->instances[0] + DART_PARAMS_8);
     u32 params_c = read32(dart->instances[0] + DART_PARAMS_C);
-    if (params_8 == DART_UNAVAILABLE || params_8 == UINT32_MAX)
+    if (!sptm_dart_live(params_8))
         return false;
 
     u8 major = (params_8 >> 8) & 0xff;
@@ -265,7 +271,7 @@ static bool sptm_dart_save_power_state(struct sptm_dart *dart)
         u64 base = dart->instances[index];
         for (size_t word = 0; word < dart->sid_words; word++) {
             u32 streams = read32(base + DART_ENABLE_STREAMS + word * sizeof(u32));
-            if (streams == DART_UNAVAILABLE || streams == UINT32_MAX)
+            if (!sptm_dart_live(streams))
                 return false;
             dart->saved_streams[index][word] = streams;
         }
