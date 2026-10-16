@@ -38,11 +38,8 @@ static bool sptm_root_geometry(u64 root, struct sptm_geometry *geometry)
         return true;
     }
 
-    if (root & SPTM_PAGE_MASK)
-        return false;
-
     u8 *entry = sptm_frame_entry(root);
-    if (!entry || !sptm_is_root_type(entry[2]))
+    if (!entry)
         return false;
 
     sptm_set_geometry(entry[12], geometry);
@@ -57,28 +54,20 @@ static u64 sptm_walk(u64 root, u64 va, unsigned int target_level,
     struct sptm_geometry geometry;
     u64 table = root;
 
-    if (!sptm_root_geometry(root, &geometry) || target_level < geometry.start_level ||
-        target_level > 3)
+    if (!sptm_root_geometry(root, &geometry) || target_level < geometry.start_level)
         return 0;
 
     const unsigned int *shifts = geometry.page_shift == 12 ? shifts_4k : shifts_16k;
 
     for (unsigned int level = geometry.start_level; level < target_level; level++) {
-        u64 slot = table + (((va >> shifts[level]) & geometry.entries_mask) * sizeof(u64));
-        if (!sptm_is_managed_range(slot, sizeof(u64)))
-            return 0;
-
-        u64 descriptor = read64(slot);
+        u64 descriptor = read64(table + ((va >> shifts[level]) & geometry.entries_mask) * 8);
         // Do not descend into a condemned table.
         if (!(descriptor & 1) || (descriptor & BIT(2)))
             return 0;
         table = descriptor & geometry.descriptor_mask;
     }
 
-    u64 slot = table + (((va >> shifts[target_level]) & geometry.entries_mask) * sizeof(u64));
-    if (!sptm_is_managed_range(slot, sizeof(u64)))
-        return 0;
-
+    u64 slot = table + ((va >> shifts[target_level]) & geometry.entries_mask) * 8;
     if (geometry_out)
         *geometry_out = geometry;
     return slot;
@@ -321,9 +310,6 @@ bool sptm_map_page(struct exc_info *ctx)
 
     u64 old = read64(slot);
     u64 scratch = sptm_scratch_pa(ctx);
-    if (!scratch)
-        return false;
-
     write64(scratch, old);
     write64(scratch + sizeof(u64), sptm.physmap_base + slot - sptm.managed_start);
 
@@ -393,28 +379,9 @@ bool sptm_map_table(struct exc_info *ctx)
 
 bool sptm_unmap_table(struct exc_info *ctx)
 {
-    u64 root = ctx->regs[0];
-    u64 va = ctx->regs[1];
-    unsigned int target_level = ctx->regs[2];
-
     struct sptm_geometry geometry;
-    u64 slot = sptm_walk(root, va, target_level, &geometry);
-    if (!slot)
-        return false;
-
+    u64 slot = sptm_walk(ctx->regs[0], ctx->regs[1], ctx->regs[2], &geometry);
     slot &= ~(geometry.page_ratio * sizeof(u64) - 1);
-    for (size_t index = 0; index < geometry.page_ratio; index++) {
-        u64 entry = slot + index * sizeof(u64);
-        if (!(read64(entry) & 1)) {
-            printf("HV: SPTM UNMAP_TABLE missing root=0x%lx va=0x%lx "
-                   "level=%u slot=0x%lx descriptor=0x%lx cpu=%u "
-                   "caller=0x%lx\n",
-                   root, va, target_level, entry, read64(entry), (unsigned int)ctx->cpu_id,
-                   ctx->elr);
-            return false;
-        }
-    }
-
     u64 child = read64(slot) & geometry.descriptor_mask;
     if (!sptm_adjust_parent_links(child, -1))
         return false;
@@ -453,27 +420,13 @@ bool sptm_update_region(struct exc_info *ctx)
     u64 flags = ctx->regs[4];
 
     struct sptm_geometry geometry;
-    if (!sptm_root_geometry(root, &geometry) || count > SPTM_MAX_SCRATCH_ENTRIES)
+    if (!sptm_root_geometry(root, &geometry))
         return false;
+
     u64 page_size = BIT(geometry.page_shift);
-    if (count > (UINT64_MAX - start) / page_size)
-        return false;
-
-    u64 templates = sptm_pointer_pa(ctx->regs[3], count * sizeof(u64));
-    if (count && !templates)
-        return false;
-
+    u64 templates = sptm_pointer_pa(ctx->regs[3]);
     u64 scratch = sptm_scratch_pa(ctx);
     u64 mask = sptm_update_mask(flags);
-    if (!scratch || !mask)
-        return false;
-
-    // Check every leaf before changing any of them.
-    for (size_t index = 0; index < count; index++) {
-        if (!sptm_walk(root, start + index * page_size, 3, NULL))
-            return false;
-    }
-
     for (size_t index = 0; index < count; index++) {
         u64 slot = sptm_walk(root, start + index * page_size, 3, NULL);
         u64 old = read64(slot);
@@ -491,25 +444,9 @@ bool sptm_update_disjoint(struct exc_info *ctx)
     size_t count = ctx->regs[2];
     u64 flags = ctx->regs[3];
 
-    if (count > SPTM_MAX_SCRATCH_ENTRIES)
-        return false;
-
-    u64 ops = sptm_pointer_pa(ctx->regs[1], count * 24);
-    if (count && !ops)
-        return false;
-
+    u64 ops = sptm_pointer_pa(ctx->regs[1]);
     u64 scratch = sptm_scratch_pa(ctx);
     u64 mask = sptm_update_mask(flags);
-    if (!scratch || !mask)
-        return false;
-
-    // Check every leaf before changing any of them.
-    for (size_t index = 0; index < count; index++) {
-        u64 op = ops + index * 24;
-        if (!sptm_walk(read64(op), read64(op + 8), 3, NULL))
-            return false;
-    }
-
     for (size_t index = 0; index < count; index++) {
         u64 op = ops + index * 24;
         u64 slot = sptm_walk(read64(op), read64(op + 8), 3, NULL);
@@ -525,43 +462,9 @@ bool sptm_update_disjoint(struct exc_info *ctx)
 bool sptm_update_disjoint_multipage(struct exc_info *ctx)
 {
     size_t slots = ctx->regs[1];
-
-    if (slots > SPTM_MAX_SCRATCH_ENTRIES)
-        return false;
-
-    u64 stream = sptm_pointer_pa(ctx->regs[0], slots * 24);
-    if (slots && !stream)
-        return false;
-
-    // Validate the entire stream before modifying mappings.
-    size_t used = 0;
-    while (used < slots) {
-        u64 header = stream + used * 24;
-        u64 paddr = read64(header);
-        size_t inner_count = read32(header + 16);
-        u64 options = read32(header + 20);
-        used++;
-
-        if (inner_count > slots - used || !sptm_update_mask(options))
-            return false;
-
-        if (!(options & BIT(9)) && sptm_is_managed_range(paddr, 1)) {
-            u64 physmap_va = sptm.physmap_base + paddr - sptm.managed_start;
-            if (!sptm_walk(sptm.kernel_root, physmap_va, 3, NULL))
-                return false;
-        }
-
-        for (size_t index = 0; index < inner_count; index++) {
-            u64 op = stream + (used + index) * 24;
-            if (!sptm_walk(read64(op), read64(op + 8), 3, NULL))
-                return false;
-        }
-        used += inner_count;
-    }
-
+    u64 stream = sptm_pointer_pa(ctx->regs[0]);
     u64 scratch = sptm_scratch_pa(ctx);
-    if (!scratch)
-        return false;
+    size_t used;
 
     if (!cpu_features->apple_sysregs_unlocked) {
         const u64 restore_tag = BIT(63);
@@ -577,8 +480,7 @@ bool sptm_update_disjoint_multipage(struct exc_info *ctx)
             size_t inner_count = read32(header + 16);
             u64 options = read32(header + 20);
 
-            if (!(options & BIT(9)) && !(paddr & SPTM_PAGE_MASK) &&
-                sptm_is_managed_range(paddr, SPTM_PAGE_SIZE)) {
+            if (!(options & BIT(9)) && sptm_is_managed_range(paddr, 1)) {
                 u64 tagged = paddr;
                 if ((papt_template & (7ULL << 2)) != PTE_MAIR_IDX(1))
                     tagged |= restore_tag;
@@ -677,16 +579,11 @@ bool sptm_unmap_region(struct exc_info *ctx)
     u64 options = ctx->regs[3];
 
     struct sptm_geometry geometry;
-    if (!sptm_root_geometry(root, &geometry) || count > SPTM_MAX_SCRATCH_ENTRIES)
+    if (!sptm_root_geometry(root, &geometry))
         return false;
+
     u64 page_size = BIT(geometry.page_shift);
-    if (count > (UINT64_MAX - start) / page_size)
-        return false;
-
     u64 scratch = sptm_scratch_pa(ctx);
-    if (!scratch)
-        return false;
-
     bool changed = false;
     for (size_t index = 0; index < count; index++) {
         u64 slot = sptm_walk(root, start + index * page_size, 3, NULL);
@@ -710,18 +607,8 @@ bool sptm_unmap_region(struct exc_info *ctx)
 bool sptm_unmap_disjoint(struct exc_info *ctx)
 {
     size_t count = ctx->regs[2];
-
-    if (count > SPTM_MAX_SCRATCH_ENTRIES)
-        return false;
-
-    u64 ops = sptm_pointer_pa(ctx->regs[1], count * 24);
-    if (count && !ops)
-        return false;
-
+    u64 ops = sptm_pointer_pa(ctx->regs[1]);
     u64 scratch = sptm_scratch_pa(ctx);
-    if (!scratch)
-        return false;
-
     bool changed = false;
     for (size_t index = 0; index < count; index++) {
         u64 op = ops + index * 24;
@@ -750,45 +637,20 @@ bool sptm_nest_region(struct exc_info *ctx, bool nest)
     u64 shared_root = ctx->regs[1];
     u64 start = ctx->regs[2];
     u64 count = ctx->regs[3];
-    struct sptm_geometry user_geometry;
-    struct sptm_geometry shared_geometry;
-
-    if (!sptm_root_geometry(user_root, &user_geometry) ||
-        (nest && !sptm_root_geometry(shared_root, &shared_geometry)))
-        return false;
-    if (nest && (user_geometry.page_shift != shared_geometry.page_shift ||
-                 user_geometry.start_level != shared_geometry.start_level ||
-                 user_geometry.entries_mask != shared_geometry.entries_mask ||
-                 user_geometry.descriptor_mask != shared_geometry.descriptor_mask))
+    struct sptm_geometry geometry;
+    if (!sptm_root_geometry(user_root, &geometry))
         return false;
 
-    u64 page_size = BIT(user_geometry.page_shift);
-    if (count > (UINT64_MAX - start) / page_size)
-        return false;
-
-    u64 bytes = count * page_size;
-    u8 l2_shift = user_geometry.page_shift == 12 ? 21 : 25;
+    // Nesting copies whole L2 entries from the shared root into the user root.
+    u64 bytes = count << geometry.page_shift;
+    u8 l2_shift = geometry.page_shift == 12 ? 21 : 25;
     u64 first_block = start >> l2_shift;
     u64 iterations = bytes ? ((start + bytes - 1) >> l2_shift) - first_block + 1 : 0;
-
-    for (u64 index = 0; index < iterations; index++) {
-        u64 va = (first_block + index) << l2_shift;
-        if (!sptm_walk(user_root, va, 2, NULL) || (nest && !sptm_walk(shared_root, va, 2, NULL)))
-            return false;
-    }
-
     bool changed = false;
-
     for (u64 index = 0; index < iterations; index++) {
         u64 va = (first_block + index) << l2_shift;
         u64 user_slot = sptm_walk(user_root, va, 2, NULL);
-
-        u64 value = 0;
-        if (nest) {
-            u64 shared_slot = sptm_walk(shared_root, va, 2, NULL);
-            value = read64(shared_slot);
-        }
-
+        u64 value = nest ? read64(sptm_walk(shared_root, va, 2, NULL)) : 0;
         if (read64(user_slot) != value) {
             write64(user_slot, value);
             changed = true;
@@ -800,13 +662,8 @@ bool sptm_nest_region(struct exc_info *ctx, bool nest)
 
 bool sptm_surt_update(struct exc_info *ctx, bool allocate)
 {
-    u64 frame = ctx->regs[0] & ~SPTM_PAGE_MASK;
-    size_t slot_index = ctx->regs[1];
-    u8 *frame_entry = sptm_frame_entry(frame);
-    if (slot_index >= SPTM_PAGE_SIZE / 128 || !frame_entry || frame_entry[2] != SPTM_FRAME_SUBPAGE)
-        return false;
-
-    u64 root = frame + slot_index * 128;
+    // Subpage roots are 128-byte slots inside a SUBPAGE frame.
+    u64 root = (ctx->regs[0] & ~SPTM_PAGE_MASK) + ctx->regs[1] * 128;
     struct sptm_surt_root *surt = sptm_find_surt_root(root);
 
     if (allocate) {
@@ -837,8 +694,7 @@ bool sptm_surt_update(struct exc_info *ctx, bool allocate)
 
 bool sptm_condemn_leaf_table(struct exc_info *ctx, bool condemn)
 {
-    struct sptm_geometry geometry;
-    u64 slot = sptm_walk(ctx->regs[0], ctx->regs[1], 2, &geometry);
+    u64 slot = sptm_walk(ctx->regs[0], ctx->regs[1], 2, NULL);
     if (!slot) {
         ctx->regs[0] = SPTM_STATUS_TABLE_NOT_PRESENT;
         return true;
@@ -856,11 +712,6 @@ bool sptm_condemn_leaf_table(struct exc_info *ctx, bool condemn)
             ctx->regs[0] = SPTM_STATUS_TABLE_NOT_PRESENT;
             return true;
         }
-
-        u64 child = value & geometry.descriptor_mask;
-        u8 *entry = sptm_frame_entry(child & ~SPTM_PAGE_MASK);
-        if (!entry || !sptm_is_table_type(entry[2]))
-            return false;
 
         write64(slot, value | BIT(2));
     } else {

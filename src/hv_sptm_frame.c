@@ -100,42 +100,8 @@ bool sptm_adjust_data_ref(u64 pa, bool writable, int delta)
     return true;
 }
 
-static bool sptm_data_ref_can_release(u64 pa, bool writable)
-{
-    u8 *entry = sptm_frame_entry(pa & ~SPTM_PAGE_MASK);
-    if (!entry)
-        return true;
-    u32 *external = sptm_external_ref_entry(pa & ~SPTM_PAGE_MASK);
-
-    spin_lock(&sptm.frame_lock);
-    size_t offset = writable ? 12 : 8;
-    size_t external_index = writable ? 1 : 0;
-    bool allowed = !sptm_is_table_type(entry[2]) && entry[2] != SPTM_FRAME_XNU_IOMMU &&
-                   read32((u64)entry + offset) >= external[external_index] &&
-                   read32((u64)entry + offset) >= 1 && external[external_index] >= 1;
-    spin_unlock(&sptm.frame_lock);
-    return allowed;
-}
-
-bool sptm_data_range_can_release(u64 pa, u64 size, bool writable)
-{
-    if (!size || pa > UINT64_MAX - size || pa + size > UINT64_MAX - SPTM_PAGE_MASK)
-        return false;
-
-    u64 start = pa & ~SPTM_PAGE_MASK;
-    u64 end = ALIGN_UP(pa + size, SPTM_PAGE_SIZE);
-    for (u64 frame = start; frame < end; frame += SPTM_PAGE_SIZE) {
-        if (!sptm_data_ref_can_release(frame, writable))
-            return false;
-    }
-    return true;
-}
-
 bool sptm_adjust_data_range(u64 pa, u64 size, bool writable, int delta)
 {
-    if (!size || pa > UINT64_MAX - size || pa + size > UINT64_MAX - SPTM_PAGE_MASK)
-        return false;
-
     u64 start = pa & ~SPTM_PAGE_MASK;
     u64 end = ALIGN_UP(pa + size, SPTM_PAGE_SIZE);
     u64 frame = start;

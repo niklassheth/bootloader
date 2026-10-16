@@ -94,7 +94,6 @@ static void sptm_dart_instances(int node, int *path, struct sptm_init_instances 
 static void sptm_dart_sid_states(int node, const char *name, struct sptm_dart_sid *states,
                                  u32 sid_count)
 {
-    u64 global_dva_base = sptm_adt_integer(node, "vm-base", 0);
     u64 global_dva_size = sptm_adt_integer(node, "vm-size", 0);
     bool dynamic = sptm_adt_integer(node, "dart-options", 0) & 0x10;
 
@@ -109,11 +108,9 @@ static void sptm_dart_sid_states(int node, const char *name, struct sptm_dart_si
         bool translating = sptm_adt_u32_contains(node, "sid", sid) ||
                            sptm_dart_mapper_sid(node, sid) || (dynamic && sid) || pt_region;
         if (translating) {
-            snprintf(property, sizeof(property), "vm-base-%u", sid);
-            state->dva_base = sptm_adt_integer(node, property, global_dva_base);
+            // Address spaces larger than 64 GiB start their walk at level 0.
             snprintf(property, sizeof(property), "vm-size-%u", sid);
-            state->dva_size = sptm_adt_integer(node, property, global_dva_size);
-            state->root_level = state->dva_size > BIT(36) ? 0 : 1;
+            state->root_level = sptm_adt_integer(node, property, global_dva_size) > BIT(36) ? 0 : 1;
         }
 
         u32 remap;
@@ -319,7 +316,6 @@ static void sptm_init_nvme(struct sptm_allocator *allocator)
     int ans_path[8];
     int ans = adt_path_offset_trace(adt, "/arm-io/ans", ans_path);
     int defaults = adt_path_offset(adt, "/defaults");
-    int carveouts = adt_path_offset(adt, "/chosen/carveout-memory-map");
     u64 main_bar, queue_bar;
     adt_get_reg(adt, ans_path, "reg", 3, &main_bar, NULL);
     if (sptm_adt_has(ans, "nvme-secure-reg-layout")) {
@@ -346,20 +342,12 @@ static void sptm_init_nvme(struct sptm_allocator *allocator)
     nvme->io_tcbs = (u64)sptm_alloc_zero(allocator, tcb_bytes, SPTM_PAGE_SIZE);
     nvme->prp_scratch = (u64)sptm_alloc_zero(allocator, prp_bytes, SPTM_PAGE_SIZE);
     nvme->command_state =
-        (u64)sptm_alloc_zero(allocator, nvme->queue_entries * SPTM_NVME_COMMAND_SIZE, 16);
+        (u64)sptm_alloc_zero(allocator, nvme->queue_entries * sizeof(struct sptm_nvme_command), 16);
 
-    u64 trusted[2];
-    ADT_GETPROP_ARRAY(adt, carveouts, "region-id-55", trusted);
     nvme->queue_bar = queue_bar;
     nvme->nvmmu = main_bar + 0x28000;
-    nvme->trusted_start = trusted[0];
-    nvme->trusted_end = trusted[0] + trusted[1];
-    nvme->xnu_managed_start = allocator->end;
-    nvme->xnu_managed_end = sptm.managed_end;
-    nvme->protocol = sptm_adt_has(ans, "nvme-linear-sq") ? 2 : 1;
     nvme->prp_flush_wa = sptm_adt_has(ans, "nvme-prp-flush-wa");
     nvme->vdma_wa = sptm_adt_has(ans, "nvme-vdma-wa");
-    nvme->sha_present = sptm_adt_has(ans, "nvme-ans-sha-present");
     if (nvme->tl_wa) {
         adt_get_reg(adt, ans_path, "reg", 10, &nvme->tl_mask, NULL);
         adt_get_reg(adt, ans_path, "reg", 11, &nvme->tl_control, NULL);
@@ -367,7 +355,7 @@ static void sptm_init_nvme(struct sptm_allocator *allocator)
     }
     if (nvme->vdma_wa)
         adt_get_reg(adt, ans_path, "reg", 13, &nvme->vdma_status, NULL);
-    if (nvme->sha_present)
+    if (sptm_adt_has(ans, "nvme-ans-sha-present"))
         adt_get_reg(adt, ans_path, "reg", 14, &nvme->sha_base, NULL);
     nvme->configured = true;
 }

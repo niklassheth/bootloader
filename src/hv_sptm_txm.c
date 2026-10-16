@@ -96,12 +96,7 @@ bool sptm_handle_txm(struct exc_info *ctx, u32 endpoint)
             break;
     }
 
-    if (ctx->regs[0] > UINT64_MAX - SPTM_TXM_RECORD_OFFSET)
-        return false;
-    u64 record = sptm_pointer_pa(ctx->regs[0] + SPTM_TXM_RECORD_OFFSET, SPTM_TXM_RECORD_SIZE);
-    if (!record)
-        return false;
-
+    u64 record = sptm_pointer_pa(ctx->regs[0] + SPTM_TXM_RECORD_OFFSET);
     memset((void *)record, 0, SPTM_TXM_RECORD_SIZE);
     write64(record + 0x08, code);
     write64(record + 0x18, word_count);

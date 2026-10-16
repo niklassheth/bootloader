@@ -18,14 +18,8 @@ static bool sptm_sart_map(struct exc_info *ctx)
     u64 size = ctx->regs[1];
     u32 permission = ctx->regs[2];
     bool guard = ctx->regs[3];
-
-    if (permission > 1 || !size || ((pa | size) & (SPTM_SART_PAGE_SIZE - 1)))
-        return false;
-
     u64 pages = size >> SPTM_SART_PAGE_SHIFT;
     u64 encoded_pages = sptm.sart_exclusive_bounds ? pages : pages - 1;
-    if (encoded_pages > 0x3fffffff || (pa >> SPTM_SART_PAGE_SHIFT) > UINT32_MAX)
-        return false;
 
     spin_lock(&sptm.service_lock);
     size_t free_index = SPTM_SART_ENTRIES;
@@ -73,39 +67,19 @@ static bool sptm_sart_unmap(struct exc_info *ctx)
     u64 size = ctx->regs[1];
 
     spin_lock(&sptm.service_lock);
-    size_t found = SPTM_SART_ENTRIES;
+    size_t found = 0;
     u32 found_flags = 0;
-    for (size_t index = 0; index < SPTM_SART_ENTRIES; index++) {
-        u32 entry_flags;
+    for (; found < SPTM_SART_ENTRIES; found++) {
         u64 entry_pa, entry_size;
-        if (sptm.sart_protected_mask & BIT(index))
+        if (sptm.sart_protected_mask & BIT(found))
             continue;
-        sptm_sart_read_entry(index, &entry_flags, &entry_pa, &entry_size);
-        if (entry_flags && entry_pa == pa && entry_size == size) {
-            found = index;
-            found_flags = entry_flags;
+        sptm_sart_read_entry(found, &found_flags, &entry_pa, &entry_size);
+        if (found_flags && entry_pa == pa && entry_size == size)
             break;
-        }
-    }
-
-    if (found == SPTM_SART_ENTRIES) {
-        printf("HV: SPTM SART cannot unmap missing region 0x%lx+0x%lx\n", pa, size);
-        spin_unlock(&sptm.service_lock);
-        return false;
     }
 
     bool writable = found_flags == 0xff;
-    if (!sptm_data_range_can_release(pa, size, writable)) {
-        spin_unlock(&sptm.service_lock);
-        return false;
-    }
-
     if (sptm.sart_guarded_mask & BIT(found)) {
-        if (!sptm.sart_guard_count ||
-            (sptm.sart_canary && read32(sptm.sart_canary) != 0xabfedeed)) {
-            spin_unlock(&sptm.service_lock);
-            return false;
-        }
         sptm.sart_guard_count--;
         sptm.sart_guarded_mask &= ~BIT(found);
     }
@@ -126,8 +100,6 @@ bool sptm_handle_sart(struct exc_info *ctx, u32 endpoint)
 {
     switch (endpoint) {
         case 0:
-            if (ctx->regs[0] > 1)
-                return false;
             ctx->regs[0] = SPTM_STATUS_SUCCESS;
             return true;
         case 1:

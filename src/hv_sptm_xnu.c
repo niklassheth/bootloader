@@ -5,27 +5,13 @@
 static char sptm_serial_line[SPTM_SERIAL_LINE_SIZE];
 static size_t sptm_serial_line_len;
 
+// Pointer signing is a no-op, so each 24-byte operation's pointer is returned unchanged.
 static bool sptm_batch_sign_user_pointers(struct exc_info *ctx)
 {
-    const size_t operation_size = 24;
-    size_t count = ctx->regs[1];
-    if (count > SPTM_MAX_SCRATCH_ENTRIES)
-        return false;
-
-    u64 operations = 0;
-    if (count) {
-        operations = sptm_pointer_pa(ctx->regs[0], count * operation_size);
-        if (!operations)
-            return false;
-    }
-
+    u64 operations = sptm_pointer_pa(ctx->regs[0]);
     u64 scratch = sptm_scratch_pa(ctx);
-    if (!scratch)
-        return false;
-
-    for (size_t index = 0; index < count; index++)
-        write64(scratch + index * sizeof(u64),
-                read64(operations + index * operation_size));
+    for (size_t index = 0; index < ctx->regs[1]; index++)
+        write64(scratch + index * sizeof(u64), read64(operations + index * 24));
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;
 }
@@ -55,17 +41,9 @@ static bool sptm_switch_root(struct exc_info *ctx)
 {
     u64 root = ctx->regs[0] & 0x0000ffffffffffffULL;
     struct sptm_surt_root *surt = sptm_find_surt_root(root);
-    u8 type = SPTM_FRAME_SUBPAGE;
-    u64 asid;
-    if (surt) {
-        asid = surt->asid;
-    } else {
-        u8 *entry = sptm_frame_entry(root);
-        if (!entry || !sptm_is_root_type(entry[2]))
-            return false;
-        type = entry[2];
-        asid = read16((u64)entry + 10);
-    }
+    u8 *entry = surt ? NULL : sptm_frame_entry(root);
+    u8 type = surt ? SPTM_FRAME_SUBPAGE : entry[2];
+    u64 asid = surt ? surt->asid : read16((u64)entry + 10);
 
     if (type == SPTM_FRAME_KERNEL_ROOT)
         msr(TTBR1_EL12, root);

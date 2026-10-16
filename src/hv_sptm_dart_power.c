@@ -229,32 +229,19 @@ static void sptm_dart_powerdown_sidebands(struct sptm_dart *dart)
 static bool sptm_dart_program_sids(struct sptm_dart *dart)
 {
     for (u32 sid = 0; sid < dart->sid_count; sid++) {
-        struct sptm_dart_sid *state = sptm_dart_sid(dart, sid);
-        if (!state || !(state->flags & SPTM_DART_SID_KNOWN) ||
-            (state->flags & SPTM_DART_SID_EXCLAVE))
+        struct sptm_dart_sid *state = &dart->sid_states[sid];
+        if (!(state->flags & SPTM_DART_SID_KNOWN) || (state->flags & SPTM_DART_SID_EXCLAVE))
             continue;
 
         u32 ttbr = 0;
-        if (state->tcr & DART_TCR_TRANSLATE) {
-            if (state->root) {
-                if (!sptm_dart_valid_table(state, state->root, SPTM_PAGE_SIZE))
-                    return false;
-                ttbr = ((state->root >> 12) & 0xfffffffcULL) | DART_TTBR_VALID;
-            }
-        } else if (!(state->flags & SPTM_DART_SID_POLICY)) {
-            return false;
-        }
+        if ((state->tcr & DART_TCR_TRANSLATE) && state->root)
+            ttbr = ((state->root >> 12) & 0xfffffffcULL) | DART_TTBR_VALID;
 
+        // Firmware-locked instances keep the SID configuration it programmed.
         for (size_t index = 0; index < dart->instance_count; index++) {
             u64 base = dart->instances[index];
-            if (read32(base + DART_REG_PROTECT) & BIT(0)) {
-                // Ignore stale locked TTBRs for non-translating SIDs.
-                if (read32(base + DART_TCR + sid * sizeof(u32)) != state->tcr ||
-                    ((state->tcr & DART_TCR_TRANSLATE) &&
-                     read32(base + DART_TTBR + sid * sizeof(u32)) != ttbr))
-                    return false;
+            if (read32(base + DART_REG_PROTECT) & BIT(0))
                 continue;
-            }
             write32(base + DART_TTBR + sid * sizeof(u32), ttbr);
             write32(base + DART_TCR + sid * sizeof(u32), state->tcr);
         }
@@ -302,7 +289,6 @@ static bool sptm_dart_discover(struct sptm_dart *dart)
     dart->counter_count = version_major >= 2 ? 9 : 6;
     dart->interrupt_status_offset =
         version_major > 2 || (version_major == 2 && version_minor >= 2) ? 0x164 : 0x160;
-    dart->initialized = true;
     return true;
 }
 
@@ -328,9 +314,9 @@ static void sptm_dart_disable_translating_streams(struct sptm_dart *dart)
 {
     u32 translating[(SPTM_MAX_DART_SIDS + 31) / 32] = {};
     for (u32 sid = 0; sid < dart->sid_count; sid++) {
-        struct sptm_dart_sid *state = sptm_dart_sid(dart, sid);
-        if (state && (state->flags & SPTM_DART_SID_KNOWN) &&
-            !(state->flags & SPTM_DART_SID_EXCLAVE) && (state->tcr & DART_TCR_TRANSLATE))
+        struct sptm_dart_sid *state = &dart->sid_states[sid];
+        if ((state->flags & SPTM_DART_SID_KNOWN) && !(state->flags & SPTM_DART_SID_EXCLAVE) &&
+            (state->tcr & DART_TCR_TRANSLATE))
             translating[sid / 32] |= BIT(sid % 32);
     }
     for (size_t index = 0; index < dart->instance_count; index++) {
@@ -366,12 +352,8 @@ static void sptm_dart_restore_runtime_state(struct sptm_dart *dart)
     sysop("dsb sy");
 }
 
-bool sptm_dart_power(struct exc_info *ctx, bool power_up)
+bool sptm_dart_power(struct exc_info *ctx, struct sptm_dart *dart, bool power_up)
 {
-    struct sptm_dart *dart = sptm_find_dart(ctx->regs[0]);
-    if (!dart || !dart->initialized)
-        return false;
-
     if (power_up) {
         if (!sptm_dart_powerup_sidebands(dart))
             return false;
@@ -409,10 +391,9 @@ bool sptm_dart_power(struct exc_info *ctx, bool power_up)
     return true;
 }
 
-bool sptm_dart_init(struct exc_info *ctx)
+bool sptm_dart_init(struct exc_info *ctx, struct sptm_dart *dart)
 {
-    struct sptm_dart *dart = sptm_find_dart(ctx->regs[0]);
-    if (!dart || !sptm_dart_discover(dart))
+    if (!sptm_dart_discover(dart))
         return false;
     ctx->regs[0] = SPTM_STATUS_SUCCESS;
     return true;

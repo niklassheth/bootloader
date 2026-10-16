@@ -29,19 +29,12 @@ bool sptm_valid_platform_pa(u64 pa, size_t size)
     return true;
 }
 
-u64 sptm_pointer_pa(u64 pointer, size_t size)
+// XNU passes its own data as physmap addresses; physical addresses pass through.
+u64 sptm_pointer_pa(u64 pointer)
 {
-    u64 pa;
-
-    if (pointer >= sptm.managed_start && pointer < sptm.managed_end) {
-        pa = pointer;
-    } else if (pointer >= sptm.physmap_base && pointer < sptm.physmap_end) {
-        pa = sptm.managed_start + pointer - sptm.physmap_base;
-    } else {
-        return 0;
-    }
-
-    return sptm_is_managed_range(pa, size) ? pa : 0;
+    if (pointer >= sptm.physmap_base && pointer < sptm.physmap_end)
+        return sptm.managed_start + pointer - sptm.physmap_base;
+    return pointer;
 }
 
 u64 sptm_iommu_table_va(u64 pa)

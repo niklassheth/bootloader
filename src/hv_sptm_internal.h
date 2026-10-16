@@ -30,7 +30,6 @@
 #define SPTM_MAX_DARTS           32
 #define SPTM_MAX_DART_INSTANCES  4
 #define SPTM_MAX_DART_SIDS       256
-#define SPTM_MAX_DART_PAGES      65536
 #define SPTM_MAX_DART_DAPF       256
 #define SPTM_MAX_DART_CLOCKS     32
 #define SPTM_MAX_DART_TUNABLES   256
@@ -44,16 +43,13 @@
 
 #define SPTM_SART_ENTRIES    16
 #define SPTM_SART_PAGE_SHIFT 12
-#define SPTM_SART_PAGE_SIZE  BIT(SPTM_SART_PAGE_SHIFT)
 
 #define SPTM_NVME_TCB_SIZE          0x80
 #define SPTM_NVME_TCB_ALIGNMENT     0x1000
 #define SPTM_NVME_PRP_PAGE_SHIFT    12
 #define SPTM_NVME_PRP_PAGE_SIZE     BIT(SPTM_NVME_PRP_PAGE_SHIFT)
-#define SPTM_NVME_PRP_PAGE_MASK     (SPTM_NVME_PRP_PAGE_SIZE - 1)
 #define SPTM_NVME_PRP_SLOT_SIZE     0x800
 #define SPTM_NVME_MAX_PRPS          0x101
-#define SPTM_NVME_COMMAND_SIZE      32
 
 #define NVMMU_QUEUE_COUNT    0x100
 #define NVMMU_ADMIN_TCB_BASE 0x108
@@ -120,8 +116,6 @@
 #define UAT_STATE_DUAL_ROOT    4
 #define UAT_STATE_GLOBAL_MODE1 8
 
-#define UAT_GUARD_UNINITIALIZED 0
-#define UAT_GUARD_BUSY          1
 #define UAT_GUARD_IDLE          2
 #define UAT_GUARD_MAP           3
 #define UAT_GUARD_PREPARE_UNMAP 4
@@ -141,8 +135,6 @@
 #define UAT_DESC_PXN            BIT(53)
 #define UAT_DESC_UXN            BIT(54)
 #define UAT_DESC_OS             BIT(55)
-
-#define UAT_MAP_OPTIONS_MASK (0xfULL | (3ULL << 8) | (0xfULL << 16))
 
 #define UAT_HANDOFF_MAGIC       0x4b1d000000000002ULL
 #define UAT_HANDOFF_MAGIC_AP    0x000
@@ -200,7 +192,6 @@
 #define SPTM_FRAME_RESTRICTED_IO           38
 #define SPTM_FRAME_RESTRICTED_IO_TELEMETRY 39
 #define SPTM_FRAME_SK_IO                   65
-#define SPTM_FRAME_TXM_SECURE_CHANNEL      61
 
 #define SPTM_COMMPAGE_USER_TIMEBASE_OFFSET 0x90
 #define SPTM_COMMPAGE_CONT_HWCLOCK_OFFSET  0x91
@@ -256,7 +247,6 @@ struct sptm_dart {
     bool hardware_flush_supported;
     bool saved_valid;
     bool limits_valid;
-    bool initialized;
     bool powered;
     bool clock_active;
 };
@@ -265,8 +255,6 @@ struct sptm_dart_sid {
     u64 root;
     u64 pt_start;
     u64 pt_end;
-    u64 dva_base;
-    u64 dva_size;
     u32 tcr;
     u8 root_level;
     u8 flags;
@@ -330,35 +318,23 @@ struct sptm_surt_root {
 struct sptm_nvme_command {
     u64 prp_aux;
     u64 drained_slots;
-    u16 count;
-    u8 qid;
-    u8 dma_flags;
-    u8 state;
-    u8 reserved[3];
     u64 first;
+    u16 count;
+    u8 dma_flags;
 };
 
-static_assert(sizeof(struct sptm_nvme_command) == SPTM_NVME_COMMAND_SIZE,
-              "unexpected NVMe command-state size");
 static_assert((SPTM_NVME_MAX_PRPS - 1) * sizeof(u64) <= SPTM_NVME_PRP_SLOT_SIZE,
               "NVMe PRP list exceeds its per-CID slot");
 
 struct sptm_nvme {
     bool configured;
-    bool coastguard_enabled;
     bool prp_flush_wa;
     bool tl_wa;
     bool vdma_wa;
-    bool sha_present;
-    u8 protocol;
     u8 tl_slots;
     u32 queue_entries;
     u64 queue_bar;
     u64 nvmmu;
-    u64 trusted_start;
-    u64 trusted_end;
-    u64 xnu_managed_start;
-    u64 xnu_managed_end;
     u64 admin_tcbs;
     u64 io_tcbs;
     u64 prp_scratch;
@@ -368,16 +344,6 @@ struct sptm_nvme {
     u64 tl_status;
     u64 vdma_status;
     u64 sha_base;
-    bool admin_queues_valid;
-    bool io_sizes_valid;
-    bool io_sq_valid;
-    bool io_cq_valid;
-    bool sha_valid;
-    u64 admin_queues[4];
-    u64 io_sizes[2];
-    u64 io_sq;
-    u64 io_cq;
-    u64 sha[3];
 };
 
 struct sptm_state {
@@ -443,7 +409,7 @@ void sptm_init_platform(struct sptm_allocator *allocator);
 /* Core */
 bool sptm_is_managed_range(u64 pa, size_t size);
 bool sptm_valid_platform_pa(u64 pa, size_t size);
-u64 sptm_pointer_pa(u64 pointer, size_t size);
+u64 sptm_pointer_pa(u64 pointer);
 u64 sptm_iommu_table_va(u64 pa);
 struct sptm_cpu *sptm_find_cpu(u32 phys_id);
 struct sptm_cpu *sptm_register_cpu(u32 phys_id);
@@ -452,10 +418,8 @@ u64 sptm_scratch_pa(struct exc_info *ctx);
 /* DART */
 struct sptm_dart *sptm_find_dart(u32 id);
 bool sptm_dart_flush_all(struct sptm_dart *dart);
-struct sptm_dart_sid *sptm_dart_sid(const struct sptm_dart *dart, u32 sid);
-bool sptm_dart_valid_table(const struct sptm_dart_sid *state, u64 pa, size_t size);
-bool sptm_dart_power(struct exc_info *ctx, bool power_up);
-bool sptm_dart_init(struct exc_info *ctx);
+bool sptm_dart_power(struct exc_info *ctx, struct sptm_dart *dart, bool power_up);
+bool sptm_dart_init(struct exc_info *ctx, struct sptm_dart *dart);
 bool sptm_handle_dart(struct exc_info *ctx, u32 endpoint);
 void sptm_dart_configure(const struct sptm_dart_config *config);
 
@@ -465,7 +429,6 @@ bool sptm_is_root_type(u8 type);
 u8 *sptm_frame_entry(u64 pa);
 u32 *sptm_external_ref_entry(u64 pa);
 bool sptm_adjust_data_ref(u64 pa, bool writable, int delta);
-bool sptm_data_range_can_release(u64 pa, u64 size, bool writable);
 bool sptm_adjust_data_range(u64 pa, u64 size, bool writable, int delta);
 bool sptm_adjust_iommu_use(u64 pa, int delta);
 bool sptm_adjust_table_valid(u64 slot, int delta);
